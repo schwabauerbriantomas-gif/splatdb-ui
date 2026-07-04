@@ -145,6 +145,7 @@ class SplatData:
         self.position = np.array(position, dtype=np.float32)  # 3D
         self.color = color          # QColor
         self.scale = np.array(scale, dtype=np.float32)         # 3D
+        self._original_scale = np.array(scale, dtype=np.float32)  # preserve for slider re-scaling
         self.rotation = rotation    # 3x3 matrix
         self.opacity = opacity      # 0–1
         self.node_data = node_data  # original node dict
@@ -288,7 +289,8 @@ class Splat3DCanvas(QWidget):
 
     def set_splat_size(self, multiplier: float):
         for s in self._splats:
-            ratio = s.scale / (s.scale.max() + 0.01)
+            # Always recompute from original scale to prevent progressive degradation
+            ratio = s._original_scale / (s._original_scale.max() + 0.01)
             s.scale = ratio * multiplier
             S2 = np.diag(s.scale ** 2)
             s.sigma_3d = s.rotation @ S2 @ s.rotation.T
@@ -441,9 +443,14 @@ class Splat3DCanvas(QWidget):
             elif self._conn_mode == "Nearest 5":
                 if not is_highlighted and weight < 0.6:
                     continue
+            elif self._conn_mode == "Nearest 10":
+                if not is_highlighted and weight < 0.4:
+                    continue
             elif self._conn_mode == "Above threshold":
                 if weight < 0.7:
                     continue
+            elif self._conn_mode == "All":
+                pass  # draw everything
 
             # Draw segmented alpha-gradient curve
             ax, ay = si.sx, si.sy
@@ -499,7 +506,7 @@ class Splat3DCanvas(QWidget):
         active = self._hovered if self._hovered >= 0 else self._selected
         if active >= 0:
             for i, j, _ in self._connections:
-                if (i == active and j == idx) or (j == active and idx == active):
+                if (i == active and j == idx) or (i == idx and j == active):
                     is_neighbor = True
                     break
 

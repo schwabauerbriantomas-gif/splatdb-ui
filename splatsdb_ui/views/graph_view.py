@@ -452,6 +452,12 @@ class GraphCanvas(QWidget):
         # Node data for tooltip
         self._node_data: list[dict] = []
 
+        # Pre-generate star field positions (avoid re-seeding RNG every frame)
+        import random
+        rng = random.Random(42)
+        self._stars = [(rng.randint(0, 2000), rng.randint(0, 2000), rng.randint(8, 30))
+                       for _ in range(80)]
+
     def set_nodes(self, nodes: list[dict], layout: str = "force"):
         """Load nodes and build the graph."""
         self._node_data = nodes
@@ -531,14 +537,12 @@ class GraphCanvas(QWidget):
         vignette.setColorAt(1.0, QColor(0, 0, 0, 120))
         painter.fillRect(0, 0, w, h, vignette)
 
-        # Subtle star-like dots
-        import random
-        rng = random.Random(42)  # Deterministic stars
+        # Subtle star-like dots (positions cached in __init__)
         painter.setPen(Qt.NoPen)
-        for _ in range(80):
-            sx = rng.randint(0, w)
-            sy = rng.randint(0, h)
-            alpha = rng.randint(8, 30)
+        for sx, sy, alpha in self._stars:
+            # Clamp to current widget size
+            sx = sx % w if w > 0 else 0
+            sy = sy % h if h > 0 else 0
             painter.setBrush(QBrush(QColor(255, 255, 255, alpha)))
             painter.drawEllipse(sx, sy, 1, 1)
 

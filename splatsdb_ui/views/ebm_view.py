@@ -438,17 +438,19 @@ class EBMCanvas(QWidget):
         self._avalanche_energy = max_e
 
     def relax_system(self):
-        """Relax energy landscape."""
+        """Relax energy landscape — distribute alpha more uniformly."""
         if not self._engine.alpha:
             return
         for _ in range(5):
             total = sum(self._engine.alpha)
             if total > 0:
                 for i in range(len(self._engine.alpha)):
-                    self._engine.alpha[i] *= 1.0 + self._engine.kappa[i] * 0.01
+                    # Decrease high-kappa splats' contribution (true relaxation)
+                    self._engine.alpha[i] *= 1.0 - self._engine.kappa[i] * 0.01
                 total = sum(self._engine.alpha)
-                for i in range(len(self._engine.alpha)):
-                    self._engine.alpha[i] /= total
+                if total > 0:
+                    for i in range(len(self._engine.alpha)):
+                        self._engine.alpha[i] /= total
         self._recompute_grid()
         self.update()
 
@@ -954,7 +956,7 @@ class EBMCanvas(QWidget):
             painter.setPen(QPen(color))
             painter.drawLine(bar_x, bar_y + i, bar_x + bar_w, bar_y + i)
 
-        painter.setPen(QColor(0))
+        painter.setPen(QColor(0, 0, 0))
         painter.drawRect(bar_x, bar_y, bar_w, bar_h)
 
         painter.setPen(QColor(Colors.TEXT_DIM))
