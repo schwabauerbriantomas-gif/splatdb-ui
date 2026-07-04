@@ -7,6 +7,7 @@ Layout: Engine switcher (top) | Search bar | View tabs (center) | IO Tray + Jobs
 
 from __future__ import annotations
 
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -172,13 +173,6 @@ class MainWindow(
         self._refresh_engine_list()
 
     def _connect_signals(self):
-        super_signals = [
-            (self.engine_switcher.engine_selected, self._on_engine_selected),
-            (self.engine_switcher.start_requested, self._on_start_requested),
-            (self.engine_switcher.add_requested, self._add_engine_dialog),
-            (self.search_bar.search_requested, self.execute_global_search),
-        ]
-
         self.engine_switcher.engine_selected.connect(self._on_engine_selected)
         self.engine_switcher.start_requested.connect(self._on_start_requested)
         self.engine_switcher.add_requested.connect(self._add_engine_dialog)

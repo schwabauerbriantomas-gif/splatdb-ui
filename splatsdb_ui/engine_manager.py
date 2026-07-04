@@ -67,7 +67,7 @@ PRESETS = {
     "default": {
         "description": "Balanced defaults — good for development",
         "device": "cpu",
-        "latent_dim": 640,
+        "latent_dim": 1024,
         "max_splats": 100000,
         "enable_quantization": True,
         "enable_graph": True,
@@ -79,7 +79,7 @@ PRESETS = {
     "simple": {
         "description": "Edge computing — stripped down, fast startup",
         "device": "cpu",
-        "latent_dim": 640,
+        "latent_dim": 1024,
         "max_splats": 10000,
         "enable_quantization": False,
         "enable_graph": False,
@@ -93,7 +93,7 @@ PRESETS = {
     "advanced": {
         "description": "Full Agentic AI — all features enabled",
         "device": "cpu",
-        "latent_dim": 640,
+        "latent_dim": 1024,
         "max_splats": 1000000,
         "enable_quantization": True,
         "quant_bits": 4,
@@ -107,18 +107,18 @@ PRESETS = {
     "training": {
         "description": "Embedding model research — training + data lake",
         "device": "cpu",
-        "latent_dim": 640,
+        "latent_dim": 1024,
         "max_splats": 500000,
         "enable_training": True,
         "enable_data_lake": True,
         "training_epochs": 50,
-        "training_matryoshka_dims": [32, 64, 128, 256, 640],
+        "training_matryoshka_dims": [32, 64, 128, 256, 1024],
         "training_distillation": True,
     },
     "distributed": {
         "description": "Multi-node cluster — auto-scaling, MapReduce",
         "device": "cpu",
-        "latent_dim": 640,
+        "latent_dim": 1024,
         "max_splats": 10000000,
         "enable_auto_scaling": True,
         "enable_mapreduce": True,
@@ -128,7 +128,7 @@ PRESETS = {
     "mcp": {
         "description": "AI agent memory — optimized for MCP server",
         "device": "auto",
-        "latent_dim": 640,
+        "latent_dim": 1024,
         "max_splats": 100000,
         "enable_quantization": True,
         "enable_graph": True,
@@ -138,7 +138,7 @@ PRESETS = {
     "gpu": {
         "description": "CUDA acceleration — GPU search, large scale",
         "device": "cuda",
-        "latent_dim": 640,
+        "latent_dim": 1024,
         "max_splats": 5000000,
         "enable_cuda": True,
         "enable_gpu_search": True,
@@ -393,10 +393,16 @@ class EngineManager(QObject):
         proc = QProcess(self)
         proc.setProcessChannelMode(QProcess.MergedChannels)
 
-        # Build arguments
-        args = ["serve", "--port", str(config.port)]
-        if config.preset != "default" and config.preset != "custom":
-            args.extend(["--preset", config.preset])
+        # Build arguments — splatsdb serve only accepts --port and --host
+        args = [
+            "serve",
+            "--port", str(config.port),
+            "--host", config.host,
+        ]
+
+        # Preset config is applied via env var or config file (future feature).
+        # The splatsdb serve command always uses SplatsDBConfig::default()
+        # internally. Custom presets require running the MCP server instead.
 
         # Environment
         env = proc.processEnvironment()

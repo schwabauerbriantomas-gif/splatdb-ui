@@ -26,3 +26,26 @@ jobs:
 
       - name: Run import smoke test
         run: python -c "import splatsdb_ui; print('import ok')"
+
+      - name: Run unit tests
+        run: python -m pytest tests/test_core.py -v
+
+      - name: Verify presets use 1024d (SplatDB v2.6 compatibility)
+        run: |
+          python -c "
+          from splatsdb_ui.engine_manager import PRESETS
+          for name, p in PRESETS.items():
+              if name == 'custom':
+                  continue
+              assert p['latent_dim'] == 1024, f'{name}: {p[\"latent_dim\"]}'
+          print('All presets 1024d OK')
+          "
+
+      - name: Verify bge-m3 is registered
+        run: |
+          python -c "
+          from splatsdb_ui.embeddings.registry import KNOWN_MODELS
+          assert 'bge-m3' in KNOWN_MODELS
+          assert KNOWN_MODELS['bge-m3'].dimension == 1024
+          print('bge-m3 registered OK')
+          "

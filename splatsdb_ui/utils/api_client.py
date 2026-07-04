@@ -207,33 +207,48 @@ class SplatsDBClient:
             ))
         return SearchResponse(results=results)
 
-    # ── Optimization stats (from optimized_api.rs) ─────────────────
+    # ── Optimization stats ─────────────────────────────────────────
+    # NOTE: These endpoints (/optimization, /prefetch, /cache/clear)
+    # do NOT exist in the current SplatsDB api_server.rs (v2.6.0).
+    # The structs exist in optimized_api.rs but are not wired to HTTP
+    # routes. These methods return empty/false until the backend adds
+    # them. Tracked for future implementation.
 
     def optimization_stats(self) -> dict:
-        """Get optimization metrics (cache, GPU, query stats)."""
+        """Get optimization metrics (cache, GPU, query stats).
+
+        Not yet implemented in SplatsDB HTTP API (v2.6.0).
+        Returns empty dict when unavailable.
+        """
         try:
             r = self.client.get("/optimization")
             r.raise_for_status()
             return r.json()
-        except (httpx.HTTPStatusError, httpx.ConnectError):
+        except (httpx.HTTPStatusError, httpx.ConnectError, httpx.HTTPError):
             return {}
 
-    # ── Prefetch suggestions ───────────────────────────────────────
-
     def prefetch_suggestions(self, n: int = 10) -> list[str]:
+        """Get prefetch suggestions.
+
+        Not yet implemented in SplatsDB HTTP API (v2.6.0).
+        Returns empty list when unavailable.
+        """
         try:
             r = self.client.get(f"/prefetch?n={n}")
             r.raise_for_status()
             return r.json().get("suggestions", [])
-        except (httpx.HTTPStatusError, httpx.ConnectError):
+        except (httpx.HTTPStatusError, httpx.ConnectError, httpx.HTTPError):
             return []
 
-    # ── Cache management ───────────────────────────────────────────
-
     def clear_cache(self) -> bool:
+        """Clear query cache.
+
+        Not yet implemented in SplatsDB HTTP API (v2.6.0).
+        Returns False when unavailable.
+        """
         try:
             r = self.client.post("/cache/clear")
             r.raise_for_status()
             return True
-        except (httpx.HTTPStatusError, httpx.ConnectError):
+        except (httpx.HTTPStatusError, httpx.ConnectError, httpx.HTTPError):
             return False

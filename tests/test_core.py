@@ -34,6 +34,9 @@ def test_imports():
     from splatsdb_ui.embeddings.registry import KNOWN_MODELS, create_engine
     assert "llama-embed-nemotron-8b" in KNOWN_MODELS
     assert KNOWN_MODELS["llama-embed-nemotron-8b"].dimension == 4096
+    # bge-m3 must be registered — matches SplatDB v2.6.0 default (1024d)
+    assert "bge-m3" in KNOWN_MODELS
+    assert KNOWN_MODELS["bge-m3"].dimension == 1024
 
     print("✅ All imports OK")
 
@@ -125,6 +128,20 @@ def test_config_fields():
     print("✅ Config fields OK")
 
 
+def test_presets_dimension():
+    """Verify all presets use 1024d to match SplatDB v2.6.0 (bge-m3)."""
+    from splatsdb_ui.engine_manager import PRESETS
+
+    for name, preset in PRESETS.items():
+        if name == "custom":
+            continue
+        assert preset["latent_dim"] == 1024, (
+            f"Preset '{name}' has latent_dim={preset['latent_dim']}, expected 1024"
+        )
+
+    print("✅ All presets dimension OK")
+
+
 def test_api_client():
     """Test API client data classes."""
     from splatsdb_ui.utils.api_client import (
@@ -132,10 +149,10 @@ def test_api_client():
         HealthResponse, SearchResponse,
     )
 
-    # Status response matches Rust struct
-    s = StatusResponse(n_active=1000, dimension=640, has_hnsw=True, has_quantization=True)
+    # Status response matches Rust struct (v2.6.0: latent_dim default is 1024)
+    s = StatusResponse(n_active=1000, dimension=1024, has_hnsw=True, has_quantization=True)
     assert s.has_hnsw
-    assert s.dimension == 640
+    assert s.dimension == 1024
 
     # Search result
     r = SearchResult(index=0, score=0.95, metadata="test")
@@ -179,6 +196,7 @@ if __name__ == "__main__":
     test_imports()
     test_engine_manager()
     test_config_fields()
+    test_presets_dimension()
     test_api_client()
     test_embedding_engine()
     print("\n🟢 All tests passed!")

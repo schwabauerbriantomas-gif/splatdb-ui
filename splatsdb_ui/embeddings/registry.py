@@ -13,6 +13,15 @@ from splatsdb_ui.embeddings.engine import ModelInfo, EmbeddingEngine
 # ── Well-known models ───────────────────────────────────────────────
 
 KNOWN_MODELS = {
+    # ── Primary: BAAI/bge-m3 — matches SplatDB v2.6.0 default (1024d) ──
+    "bge-m3": ModelInfo(
+        name="bge-m3",
+        display_name="BGE-M3 (1024D, multilingual — SplatDB default)",
+        dimension=1024,
+        provider="sentence",
+        path="BAAI/bge-m3",
+        size_gb=2.4,
+    ),
     "llama-embed-nemotron-8b": ModelInfo(
         name="llama-embed-nemotron-8b",
         display_name="LLaMA-Embed Nemotron 8B (NVIDIA)",
