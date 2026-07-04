@@ -75,7 +75,12 @@ class JobQueuePanel(QWidget):
         self.count_label.setText(f"{len(self._jobs)} active")
 
     def finish_job(self, job_id: str, success: bool):
-        item = self._jobs.get(job_id)
+        """Mark a job as finished and remove it from the panel.
+
+        The job item is deleted to prevent memory leaks from accumulating
+        completed jobs.
+        """
+        item = self._jobs.pop(job_id, None)
         if item:
             if success:
                 item.status_label.setText("Done")
@@ -83,6 +88,10 @@ class JobQueuePanel(QWidget):
             else:
                 item.status_label.setText("Failed")
                 item.status_label.setStyleSheet(f"color: {Colors.ERROR}; font-size: 11px;")
+            # Remove widget from layout and schedule deletion
+            self._jobs_layout.removeWidget(item)
+            item.deleteLater()
+        self.count_label.setText(f"{len(self._jobs)} active")
 
     def update_job(self, job_id: str, progress: int):
         item = self._jobs.get(job_id)

@@ -254,11 +254,11 @@ class MainWindow(
         for ci, cluster in enumerate(cluster_defs):
             for li, label in enumerate(cluster["labels"]):
                 # Structured vector: cluster center + noise
-                base_vec = np.zeros(64, dtype=np.float32)
+                base_vec = np.zeros(1024, dtype=np.float32)
                 base_vec[ci * 4] = 3.0       # cluster signal in dim 0,4,8,12
                 base_vec[ci * 4 + 1] = 2.0
                 base_vec[ci * 4 + 2] = 1.0
-                noise = np.random.randn(64) * 0.5
+                noise = np.random.randn(1024) * 0.5
                 vector = (base_vec + noise).tolist()
 
                 connections = []

@@ -14,7 +14,8 @@ class ResultCard(QFrame):
     def __init__(self, index: int, score: float, metadata: str = ""):
         super().__init__()
         self.index = index
-        self.score = score
+        # Clamp score to [0.0, 1.0] to handle out-of-range values from backend
+        self.score = max(0.0, min(1.0, float(score or 0.0)))
         self.metadata = metadata
         self._build_ui()
 

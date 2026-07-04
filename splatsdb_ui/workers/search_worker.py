@@ -2,7 +2,7 @@
 """Search worker — runs search queries in a QThread."""
 
 from PySide6.QtCore import QObject, Signal
-from splatsdb_ui.utils.api_client import SplatsDBClient, SearchResult
+from splatsdb_ui.utils.api_client import SplatsDBClient
 
 
 class SearchWorker(QObject):
@@ -18,12 +18,13 @@ class SearchWorker(QObject):
         self.api_key = api_key
 
     def run(self):
+        client = None
         try:
             client = SplatsDBClient(base_url=self.client_url, api_key=self.api_key)
             results = client.search(self.query, top_k=self.top_k)
-            self.finished.emit(results)
+            self.finished.emit(results.results)
         except Exception as e:
             self.error.emit(str(e))
-            self.finished.emit([])
         finally:
-            client.close()
+            if client is not None:
+                client.close()

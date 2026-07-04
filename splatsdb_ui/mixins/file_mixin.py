@@ -28,9 +28,9 @@ class FileMixin:
         ext = path.rsplit(".", 1)[-1].lower()
         if ext in ("png", "jpg", "jpeg", "tiff", "bmp", "pdf"):
             self.switch_view("ocr")
-            ocr_view = self._views["ocr"]
-            ocr_view._current_file = path
-            ocr_view.file_label.setText(path)
+            ocr_view = self._views.get("ocr")
+            if ocr_view and hasattr(ocr_view, "set_file"):
+                ocr_view.set_file(path)
         elif ext in ("bin", "fvecs", "bvecs", "ivecs"):
             self.switch_view("collections")
         else:

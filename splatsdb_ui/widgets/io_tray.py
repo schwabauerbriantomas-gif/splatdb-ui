@@ -23,9 +23,10 @@ class IOTray(QWidget):
         lbl.setStyleSheet(f"color: {Colors.TEXT_DIM}; font-size: 10px; font-weight: 700; letter-spacing: 1.0px;")
         header.addWidget(lbl)
         header.addStretch()
-        clear_btn = QPushButton("Clear")
-        clear_btn.setFixedWidth(60)
-        header.addWidget(clear_btn)
+        self.clear_btn = QPushButton("Clear")
+        self.clear_btn.setFixedWidth(60)
+        self.clear_btn.clicked.connect(self.clear)
+        header.addWidget(self.clear_btn)
         layout.addLayout(header)
 
         self.scroll = QScrollArea()
@@ -38,3 +39,14 @@ class IOTray(QWidget):
         layout.addWidget(self.scroll)
 
         self.setStyleSheet(f"background-color: {Colors.BG_RAISED}; border-top: 1px solid {Colors.BORDER};")
+
+    def add_item(self, widget: QWidget):
+        """Add a widget item to the tray."""
+        self.items_layout.addWidget(widget)
+
+    def clear(self):
+        """Remove all items from the tray."""
+        while self.items_layout.count():
+            item = self.items_layout.takeAt(0)
+            if item.widget():
+                item.widget().deleteLater()

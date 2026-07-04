@@ -81,16 +81,41 @@ class SearchView(QWidget):
         self.status_label.setText(f"Searching: {query}...")
         self.signals.search_requested.emit(query)
 
-    def execute_search(self, query: str):
-        self.query_input.setText(query)
-        self._on_search()
+    def set_loading(self, loading: bool):
+        """Toggle loading state."""
+        if loading:
+            self.status_label.setText("Searching...")
+        else:
+            pass  # show_results will update the status
 
     def show_results(self, results: list):
-        for child in self.results_layout.children():
-            child.widget().deleteLater()
+        """Display search results.
+
+        Args:
+            results: List of SearchResult objects or dicts with keys
+                     'index', 'score', 'metadata', 'text'.
+        """
+        # Clear previous results safely (handle stretch items where widget() is None)
+        while self.results_layout.count():
+            item = self.results_layout.takeAt(0)
+            if item.widget():
+                item.widget().deleteLater()
+
+        if not results:
+            self.status_label.setText("No results")
+            return
+
         for i, r in enumerate(results):
-            card = ResultCard(index=i, score=r.get("score", 0), metadata=r.get("text", ""))
+            # Support both SearchResult objects and dicts
+            if hasattr(r, "score"):
+                score = r.score
+                text = getattr(r, "text", "") or getattr(r, "metadata", "") or ""
+            else:
+                score = r.get("score", 0.0)
+                text = r.get("text", "") or r.get("metadata", "")
+            card = ResultCard(index=i, score=score, metadata=text)
             self.results_layout.addWidget(card)
+
         self.status_label.setText(f"{len(results)} results")
 
     def get_params(self) -> list:

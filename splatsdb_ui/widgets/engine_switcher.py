@@ -26,6 +26,7 @@ class EngineSwitcher(QWidget):
 
     def __init__(self):
         super().__init__()
+        self._current_status = EngineStatus.STOPPED
         self.setFixedHeight(44)
         self._build_ui()
 
@@ -126,6 +127,7 @@ class EngineSwitcher(QWidget):
         self.engine_combo.blockSignals(False)
 
     def update_status(self, name: str, status: EngineStatus):
+        self._current_status = status
         color = DOT_COLORS.get(status, Colors.TEXT_DIM)
         self._set_dot_color(color)
         self._style_power(status == EngineStatus.RUNNING)
@@ -137,5 +139,9 @@ class EngineSwitcher(QWidget):
 
     def _on_power(self):
         name = self.engine_combo.currentText().split("  ")[0]
-        if name:
+        if not name:
+            return
+        if self._current_status == EngineStatus.RUNNING:
+            self.stop_requested.emit(name)
+        else:
             self.start_requested.emit(name)

@@ -29,24 +29,28 @@ class CollectionsView(QWidget):
 
         import_btn = QPushButton("Import")
         import_btn.setIcon(icon("upload", Colors.TEXT))
+        import_btn.clicked.connect(self._import)
         header.addWidget(import_btn)
 
-        refresh_btn = QPushButton()
-        refresh_btn.setIcon(icon("refresh", Colors.TEXT_DIM))
-        refresh_btn.setFixedSize(32, 32)
-        header.addWidget(refresh_btn)
+        self.refresh_btn = QPushButton()
+        self.refresh_btn.setIcon(icon("refresh", Colors.TEXT_DIM))
+        self.refresh_btn.setFixedSize(32, 32)
+        self.refresh_btn.clicked.connect(self._refresh)
+        header.addWidget(self.refresh_btn)
 
-        add_btn = QPushButton()
-        add_btn.setIcon(icon("plus", Colors.BG))
-        add_btn.setFixedSize(32, 32)
-        add_btn.setProperty("class", "primary")
-        header.addWidget(add_btn)
+        self.add_btn = QPushButton()
+        self.add_btn.setIcon(icon("plus", Colors.BG))
+        self.add_btn.setFixedSize(32, 32)
+        self.add_btn.setProperty("class", "primary")
+        self.add_btn.clicked.connect(self._add_collection)
+        header.addWidget(self.add_btn)
 
-        del_btn = QPushButton()
-        del_btn.setIcon(icon("trash", "#fca5a5"))
-        del_btn.setFixedSize(32, 32)
-        del_btn.setProperty("danger", "true")
-        header.addWidget(del_btn)
+        self.del_btn = QPushButton()
+        self.del_btn.setIcon(icon("trash", "#fca5a5"))
+        self.del_btn.setFixedSize(32, 32)
+        self.del_btn.setProperty("danger", "true")
+        self.del_btn.clicked.connect(self._delete_collection)
+        header.addWidget(self.del_btn)
 
         layout.addLayout(header)
 
@@ -60,8 +64,35 @@ class CollectionsView(QWidget):
         self.status.setStyleSheet(f"color: {Colors.TEXT_DIM}; font-size: 11px;")
         layout.addWidget(self.status)
 
+    def _import(self):
+        """Import vectors from file."""
+        from PySide6.QtWidgets import QFileDialog
+        files, _ = QFileDialog.getOpenFileNames(
+            self, "Import Vectors", "",
+            "Vectors (*.bin *.fvecs *.bvecs);;All Files (*)",
+        )
+        if files:
+            self.signals.status_message.emit(f"Importing {len(files)} files...")
+
+    def _refresh(self):
+        """Refresh collection list."""
+        self.signals.status_message.emit("Refreshing collections...")
+
+    def _add_collection(self):
+        """Add a new collection."""
+        self.signals.status_message.emit("Add collection (not yet implemented)")
+
+    def _delete_collection(self):
+        """Delete the selected collection."""
+        item = self.tree.currentItem()
+        if item:
+            name = item.text(0)
+            self.signals.status_message.emit(f"Delete collection: {name}")
+        else:
+            self.signals.status_message.emit("No collection selected")
+
     def get_params(self) -> list:
         return [
-            {"name": "dimension", "label": "Dimension", "type": "spin", "min": 1, "max": 8192, "default": 640},
+            {"name": "dimension", "label": "Dimension", "type": "spin", "min": 1, "max": 8192, "default": 1024},
             {"name": "distance", "label": "Distance", "type": "combo", "options": ["cosine", "l2", "ip"]},
         ]

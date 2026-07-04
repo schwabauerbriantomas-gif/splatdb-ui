@@ -42,27 +42,32 @@ class SettingsMixin:
     def save_config(self):
         """Persist current state to disk."""
         config_file = self.state.config_dir / "config.json"
-        cfg = {
-            "backend": {
-                "url": self.state.connection.url,
-                "api_key": self.state.connection.api_key,
-            },
-            "embedding": {
-                "active_model": self.state.embedding.active_model,
-                "device": self.state.embedding.device,
-            },
-            "ocr": {
-                "engine": self.state.ocr.engine,
-                "language": self.state.ocr.language,
-            },
-            "ui": {
-                "theme": self.state.ui.theme,
-                "sounds_enabled": self.state.ui.sounds_enabled,
-                "font_size": self.state.ui.font_size,
-            },
-        }
-        with open(config_file, "w") as f:
-            json.dump(cfg, f, indent=2)
+        try:
+            cfg = {
+                "backend": {
+                    "url": self.state.connection.url,
+                    "api_key": self.state.connection.api_key,
+                },
+                "embedding": {
+                    "active_model": self.state.embedding.active_model,
+                    "device": self.state.embedding.device,
+                },
+                "ocr": {
+                    "engine": self.state.ocr.engine,
+                    "language": self.state.ocr.language,
+                },
+                "ui": {
+                    "theme": self.state.ui.theme,
+                    "sounds_enabled": self.state.ui.sounds_enabled,
+                    "font_size": self.state.ui.font_size,
+                },
+            }
+            with open(config_file, "w") as f:
+                json.dump(cfg, f, indent=2)
+        except Exception as e:
+            # Don't crash the app on close if config save fails
+            import sys
+            print(f"[splatsdb-ui] Warning: failed to save config: {e}", file=sys.stderr)
 
     def open_settings(self):
         """Open the settings dialog."""

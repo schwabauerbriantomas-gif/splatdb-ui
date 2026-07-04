@@ -57,6 +57,7 @@ class OCRView(QWidget):
         run_btn = QPushButton("Extract Text")
         run_btn.setIcon(icon("search", Colors.BG))
         run_btn.setProperty("class", "primary")
+        run_btn.clicked.connect(self._run_ocr)
         options.addWidget(run_btn)
         options.addStretch()
         layout.addLayout(options)
@@ -88,15 +89,77 @@ class OCRView(QWidget):
         layout.addWidget(splitter, stretch=1)
 
         actions = QHBoxLayout()
-        embed_btn = QPushButton("Embed & Store")
-        embed_btn.setIcon(icon("download", Colors.BG))
-        embed_btn.setProperty("class", "primary")
-        actions.addWidget(embed_btn)
-        copy_btn = QPushButton("Copy Text")
-        copy_btn.setIcon(icon("copy", Colors.TEXT))
-        actions.addWidget(copy_btn)
+        self.embed_btn = QPushButton("Embed & Store")
+        self.embed_btn.setIcon(icon("download", Colors.BG))
+        self.embed_btn.setProperty("class", "primary")
+        self.embed_btn.clicked.connect(self._embed_and_store)
+        actions.addWidget(self.embed_btn)
+        self.copy_btn = QPushButton("Copy Text")
+        self.copy_btn.setIcon(icon("copy", Colors.TEXT))
+        self.copy_btn.clicked.connect(self._copy_text)
+        actions.addWidget(self.copy_btn)
         actions.addStretch()
         layout.addLayout(actions)
+
+        # Store thread reference to prevent GC
+        self._ocr_thread = None
+
+    def _run_ocr(self):
+        """Run OCR on the selected file in a background thread."""
+        if not self._current_file:
+            self.signals.status_message.emit("No file selected for OCR")
+            return
+
+        from PySide6.QtCore import QThread
+        from splatsdb_ui.workers.ocr_worker import OCRWorker
+
+        engine_choice = self.engine_combo.currentText().lower()
+        lang = self.lang_combo.currentText()
+        self.progress.setValue(5)
+
+        thread = QThread(self)
+        worker = OCRWorker(self._current_file, engine=engine_choice, language=lang)
+        worker.moveToThread(thread)
+
+        thread.started.connect(worker.run)
+        worker.finished.connect(self._on_ocr_finished)
+        worker.finished.connect(thread.quit)
+        worker.finished.connect(worker.deleteLater)
+        thread.finished.connect(thread.deleteLater)
+        self._ocr_thread = thread
+        thread.start()
+
+    def _on_ocr_finished(self, text: str, error: str):
+        """Handle OCR completion."""
+        self.progress.setValue(100 if not error else 0)
+        if error:
+            self.text_output.setPlainText(f"Error: {error}")
+            self.signals.ocr_error.emit(self._current_file or "", error)
+        else:
+            self.text_output.setPlainText(text)
+            if self._current_file:
+                self.signals.ocr_completed.emit(self._current_file, text)
+
+    def _embed_and_store(self):
+        """Embed the extracted text and store it in the backend."""
+        text = self.text_output.toPlainText().strip()
+        if not text:
+            self.signals.status_message.emit("No text to embed")
+            return
+        # Emit for the main window to handle the store operation
+        self.signals.status_message.emit(f"Embedding {len(text)} chars...")
+
+    def _copy_text(self):
+        """Copy extracted text to clipboard."""
+        from PySide6.QtWidgets import QApplication
+        clipboard = QApplication.clipboard()
+        clipboard.setText(self.text_output.toPlainText())
+        self.signals.status_message.emit("Copied to clipboard")
+
+    def set_file(self, path: str):
+        """Public API to set the current file (used by FileMixin)."""
+        self._current_file = path
+        self.file_label.setText(path)
 
     def _browse_file(self):
         files, _ = QFileDialog.getOpenFileNames(

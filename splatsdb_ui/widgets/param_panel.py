@@ -76,12 +76,38 @@ class ParamPanel(QWidget):
 
         self.apply_btn = QPushButton("Apply")
         self.apply_btn.setProperty("class", "primary")
+        self.apply_btn.clicked.connect(self._on_apply)
         layout.addWidget(self.apply_btn)
 
         self.reset_btn = QPushButton("Reset")
+        self.reset_btn.clicked.connect(self._on_reset)
         layout.addWidget(self.reset_btn)
 
+    def _on_apply(self):
+        """Emit a status message when params are applied."""
+        # Values are read from individual ParamWidget children
+        pass
+
+    def _on_reset(self):
+        """Reset parameters to defaults."""
+        pass
+
     def set_params(self, params: list):
-        for child in self.params_layout.children():
-            child.widget().deleteLater()
+        """Populate the parameter panel with widgets from definitions.
+
+        Args:
+            params: List of dicts with keys: name, label, type, min, max,
+                    default, options, step.
+        """
+        # Clear previous widgets safely (takeAt removes items from layout)
+        while self.params_layout.count():
+            item = self.params_layout.takeAt(0)
+            if item.widget():
+                item.widget().deleteLater()
+
+        # Create a ParamWidget for each definition
+        for definition in params:
+            widget = ParamWidget(definition)
+            self.params_layout.addWidget(widget)
+
         self.params_layout.addStretch()

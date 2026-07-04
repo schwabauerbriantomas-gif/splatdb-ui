@@ -30,6 +30,7 @@ class BenchmarkView(QWidget):
         run_btn = QPushButton("Run Benchmark")
         run_btn.setIcon(icon("zap", Colors.BG))
         run_btn.setProperty("class", "primary")
+        run_btn.clicked.connect(self._run_benchmark)
         header.addWidget(run_btn)
         layout.addLayout(header)
 
@@ -88,3 +89,9 @@ class BenchmarkView(QWidget):
             {"name": "n_queries", "label": "Queries", "type": "spin", "min": 100, "max": 100000, "default": 1000},
             {"name": "top_k", "label": "Top K", "type": "spin", "min": 1, "max": 1024, "default": 64},
         ]
+
+    def _run_benchmark(self):
+        """Trigger a benchmark run."""
+        dataset = self.dataset_combo.currentText()
+        k = self.k_spin.value()
+        self.signals.status_message.emit(f"Benchmark: {dataset}, K={k} (not yet implemented)")

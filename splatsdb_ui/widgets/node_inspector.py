@@ -54,6 +54,7 @@ class NodeInspector(QWidget):
         self.close_btn.setIcon(icon("cross", Colors.TEXT_DIM))
         self.close_btn.setFixedSize(24, 24)
         self.close_btn.setStyleSheet("QPushButton { background: transparent; border: none; } QPushButton:hover { background-color: #21262d; border-radius: 4px; }")
+        self.close_btn.clicked.connect(self.hide)
         header.addWidget(self.close_btn)
 
         header_widget = QWidget()
@@ -224,6 +225,11 @@ class NodeInspector(QWidget):
 
         # Connections
         connections = node.get("connections", [])
+        # Clean up previous cell widgets to prevent memory leaks
+        for r in range(self.conn_table.rowCount()):
+            w = self.conn_table.cellWidget(r, 3)
+            if w:
+                w.deleteLater()
         self.conn_table.setRowCount(0)
         for conn in connections:
             row = self.conn_table.rowCount()

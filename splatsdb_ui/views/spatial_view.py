@@ -796,7 +796,13 @@ class SpatialControls(QWidget):
         # Flow toggle
         self.flow_btn = QPushButton("Show Flow")
         self.flow_btn.setCheckable(True)
+        self.flow_btn.toggled.connect(self._on_flow_toggled)
         layout.addWidget(self.flow_btn)
+
+    def _on_flow_toggled(self):
+        """Handle flow toggle — regenerate the view."""
+        if hasattr(self, "_regenerate"):
+            self._regenerate()
 
         # Regenerate
         gen_btn = QPushButton("Regenerate")
