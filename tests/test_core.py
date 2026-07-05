@@ -5,7 +5,7 @@
 def test_imports():
     """Verify all modules import correctly."""
     from splatsdb_ui import __version__, __app_name__
-    assert __version__ == "0.1.0"
+    assert __version__ == "0.2.0"
     assert __app_name__ == "SplatsDB"
 
     # Utils
