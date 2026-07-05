@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: GPL-3.0
-"""HTTP API client for SplatsDB backend.
+"""HTTP API client for SplatDB backend.
 
 Mirrors the Rust API exactly:
   GET  /health           → HealthResponse
@@ -90,8 +90,8 @@ class CacheStats:
     size: int = 0
 
 
-class SplatsDBClient:
-    """HTTP client for SplatsDB Axum backend.
+class SplatDBClient:
+    """HTTP client for SplatDB Axum backend.
 
     Endpoint mapping (Rust api_server.rs):
         GET  /health          → HealthResponse
@@ -209,7 +209,7 @@ class SplatsDBClient:
 
     # ── Optimization stats ─────────────────────────────────────────
     # NOTE: These endpoints (/optimization, /prefetch, /cache/clear)
-    # do NOT exist in the current SplatsDB api_server.rs (v2.6.0).
+    # do NOT exist in the current SplatDB api_server.rs (v2.6.0).
     # The structs exist in optimized_api.rs but are not wired to HTTP
     # routes. These methods return empty/false until the backend adds
     # them. Tracked for future implementation.
@@ -217,7 +217,7 @@ class SplatsDBClient:
     def optimization_stats(self) -> dict:
         """Get optimization metrics (cache, GPU, query stats).
 
-        Not yet implemented in SplatsDB HTTP API (v2.6.0).
+        Not yet implemented in SplatDB HTTP API (v2.6.0).
         Returns empty dict when unavailable.
         """
         try:
@@ -230,7 +230,7 @@ class SplatsDBClient:
     def prefetch_suggestions(self, n: int = 10) -> list[str]:
         """Get prefetch suggestions.
 
-        Not yet implemented in SplatsDB HTTP API (v2.6.0).
+        Not yet implemented in SplatDB HTTP API (v2.6.0).
         Returns empty list when unavailable.
         """
         try:
@@ -243,7 +243,7 @@ class SplatsDBClient:
     def clear_cache(self) -> bool:
         """Clear query cache.
 
-        Not yet implemented in SplatsDB HTTP API (v2.6.0).
+        Not yet implemented in SplatDB HTTP API (v2.6.0).
         Returns False when unavailable.
         """
         try:

@@ -6,7 +6,7 @@ from splatsdb_ui.utils.theme import Colors
 from splatsdb_ui.utils.icons import icon
 
 
-class SplatsDBStatusBar(QStatusBar):
+class SplatDBStatusBar(QStatusBar):
     def __init__(self):
         super().__init__()
         self._build_ui()

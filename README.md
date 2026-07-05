@@ -1,8 +1,8 @@
 <div align="center">
 
-# SplatsDB UI
+# SplatDB UI
 
-**Professional desktop interface for [SplatsDB](https://github.com/schwabauerbriantomas-gif/m2m-vector-search) — Gaussian Splat vector search engine**
+**Professional desktop interface for [SplatDB](https://github.com/schwabauerbriantomas-gif/m2m-vector-search) — Gaussian Splat vector search engine**
 
 [![CI](https://github.com/schwabauerbriantomas-gif/splatsdb-ui/actions/workflows/ci.yml/badge.svg)](https://github.com/schwabauerbriantomas-gif/splatsdb-ui/actions/workflows/ci.yml)
 [![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
@@ -14,7 +14,7 @@
 
 ## Overview
 
-SplatsDB UI is a professional desktop application for managing and visualizing vector search operations using the SplatsDB Gaussian Splat engine. Built with PySide6 (Qt 6) and a dark, Linear-inspired theme.
+SplatDB UI is a professional desktop application for managing and visualizing vector search operations using the SplatDB Gaussian Splat engine. Built with PySide6 (Qt 6) and a dark, Linear-inspired theme.
 
 ## Features
 
@@ -47,11 +47,11 @@ splatsdb-ui
 | Requirement | Version |
 |-------------|---------|
 | Python | 3.10+ |
-| SplatsDB backend | v2.6.0 (`splatsdb serve` on port 8199) |
+| SplatDB backend | v2.6.0 (`splatsdb serve` on port 8199) |
 | PySide6 | 6.6+ |
 | NVIDIA GPU | Optional, for CUDA embeddings |
 
-## SplatsDB Backend Compatibility
+## SplatDB Backend Compatibility
 
 This UI targets **SplatDB v2.6.0** with bge-m3 embeddings (1024 dimensions).
 
@@ -88,7 +88,7 @@ splatsdb_ui/
 │   └── collections_view.py      # Collection browser
 ├── widgets/                 # Reusable UI components
 │   ├── engine_switcher.py       # Backend selector (play/stop)
-│   ├── config_editor.py         # Full SplatsDB config (60+ params)
+│   ├── config_editor.py         # Full SplatDB config (60+ params)
 │   ├── param_panel.py           # Dynamic parameter sidebar
 │   ├── node_inspector.py        # Node detail + connections table
 │   ├── file_preview.py          # PDF/image preview
@@ -106,7 +106,7 @@ splatsdb_ui/
 ├── dialogs/                 # Modal dialogs
 │   └── about_dialog.py          # About dialog with project info
 └── utils/                   # Utilities
-    ├── api_client.py            # SplatsDB HTTP API client
+    ├── api_client.py            # SplatDB HTTP API client
     ├── state.py                 # Application state containers
     ├── signals.py               # Global signal bus
     ├── icons.py                 # SVG icon system

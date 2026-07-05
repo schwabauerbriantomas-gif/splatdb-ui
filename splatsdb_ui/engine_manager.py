@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: GPL-3.0
 """Engine Manager — LM Studio-style backend switcher.
 
-Manages multiple SplatsDB backends:
+Manages multiple SplatDB backends:
   - Local process (spawn splatsdb serve)
   - Remote HTTP (any URL)
   - Switch between engines at runtime
@@ -38,7 +38,7 @@ class EngineType(Enum):
 
 @dataclass
 class EngineConfig:
-    """Configuration for a single SplatsDB engine/backend."""
+    """Configuration for a single SplatDB engine/backend."""
     name: str
     engine_type: str          # local | remote | wsl
     binary_path: str = ""     # Path to splatsdb binary (local/wsl)
@@ -153,7 +153,7 @@ PRESETS = {
     },
 }
 
-# All SplatsDBConfig fields with metadata for the config editor
+# All SplatDBConfig fields with metadata for the config editor
 CONFIG_FIELDS = {
     # System
     "device": {"label": "Device", "type": "combo", "options": ["auto", "cpu", "cuda", "vulkan"], "group": "System"},
@@ -279,7 +279,7 @@ CONFIG_FIELDS = {
 
 
 class EngineManager(QObject):
-    """Manages multiple SplatsDB engine backends — LM Studio style.
+    """Manages multiple SplatDB engine backends — LM Studio style.
 
     Features:
       - Add/remove/switch engines
@@ -401,7 +401,7 @@ class EngineManager(QObject):
         ]
 
         # Preset config is applied via env var or config file (future feature).
-        # The splatsdb serve command always uses SplatsDBConfig::default()
+        # The splatsdb serve command always uses SplatDBConfig::default()
         # internally. Custom presets require running the MCP server instead.
 
         # Environment

@@ -2,11 +2,11 @@
 """Search worker — runs search queries in a QThread."""
 
 from PySide6.QtCore import QObject, Signal
-from splatsdb_ui.utils.api_client import SplatsDBClient
+from splatsdb_ui.utils.api_client import SplatDBClient
 
 
 class SearchWorker(QObject):
-    """Executes a search query against the SplatsDB backend in a background thread."""
+    """Executes a search query against the SplatDB backend in a background thread."""
     finished = Signal(list)  # list[SearchResult]
     error = Signal(str)
 
@@ -20,7 +20,7 @@ class SearchWorker(QObject):
     def run(self):
         client = None
         try:
-            client = SplatsDBClient(base_url=self.client_url, api_key=self.api_key)
+            client = SplatDBClient(base_url=self.client_url, api_key=self.api_key)
             results = client.search(self.query, top_k=self.top_k)
             self.finished.emit(results.results)
         except Exception as e:

@@ -6,7 +6,7 @@ import os
 
 
 def run():
-    """Launch the SplatsDB UI application."""
+    """Launch the SplatDB UI application."""
     # High DPI support
     os.environ["QT_ENABLE_HIGHDPI_SCALING"] = "1"
 
@@ -19,7 +19,7 @@ def run():
 
     app = QApplication(sys.argv)
     app.setApplicationName(__app_name__)
-    app.setOrganizationName("SplatsDB")
+    app.setOrganizationName("SplatDB")
     app.setApplicationVersion("0.1.0")
 
     # Load dark theme

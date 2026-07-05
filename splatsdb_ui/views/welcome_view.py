@@ -137,7 +137,7 @@ class WelcomeView(QWidget):
 
         header = QVBoxLayout()
         header.setSpacing(4)
-        title = QLabel("SplatsDB")
+        title = QLabel("SplatDB")
         title.setStyleSheet(f"color: {Colors.TEXT}; font-size: 28px; font-weight: 700; letter-spacing: -0.5px;")
         header.addWidget(title)
         subtitle = QLabel("Vector search engine with semantic memory")

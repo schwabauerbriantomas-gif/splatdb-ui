@@ -6,14 +6,14 @@ def test_imports():
     """Verify all modules import correctly."""
     from splatsdb_ui import __version__, __app_name__
     assert __version__ == "0.2.0"
-    assert __app_name__ == "SplatsDB"
+    assert __app_name__ == "SplatDB"
 
     # Utils
     from splatsdb_ui.utils.signals import SignalBus
     from splatsdb_ui.utils.state import AppState
     from splatsdb_ui.utils.theme import DARK_QSS
     from splatsdb_ui.utils.api_client import (
-        SplatsDBClient, SearchResult, SearchResponse, StoreRequest,
+        SplatDBClient, SearchResult, SearchResponse, StoreRequest,
         StoreResponse, StatusResponse, HealthResponse,
         OptimizationMetrics, GpuConfig, CacheStats,
     )
@@ -24,7 +24,7 @@ def test_imports():
         PRESETS, CONFIG_FIELDS,
     )
     assert len(PRESETS) == 8  # default, simple, advanced, training, distributed, mcp, gpu, custom
-    assert len(CONFIG_FIELDS) >= 60  # All SplatsDB config fields
+    assert len(CONFIG_FIELDS) >= 60  # All SplatDB config fields
 
     # Embeddings
     from splatsdb_ui.embeddings.engine import (

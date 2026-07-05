@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: GPL-3.0
-"""SplatsDB UI — Main Application Window.
+"""SplatDB UI — Main Application Window.
 
 Layout: Engine switcher (top) | Search bar | View tabs (center) | IO Tray + Jobs (bottom) | Status
 3D tab has splitter: 3D View | Node Inspector | File Preview
@@ -33,7 +33,7 @@ from splatsdb_ui.widgets.search_bar import GlobalSearchBar
 from splatsdb_ui.widgets.param_panel import ParamPanel
 from splatsdb_ui.widgets.io_tray import IOTray
 from splatsdb_ui.widgets.job_queue import JobQueuePanel
-from splatsdb_ui.widgets.status_bar import SplatsDBStatusBar
+from splatsdb_ui.widgets.status_bar import SplatDBStatusBar
 from splatsdb_ui.widgets.node_inspector import NodeInspector
 from splatsdb_ui.widgets.file_preview import FilePreview
 
@@ -63,7 +63,7 @@ class MainWindow(
 ):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("SplatsDB")
+        self.setWindowTitle("SplatDB")
         self.setMinimumSize(1200, 800)
         self.resize(1440, 900)
 
@@ -167,7 +167,7 @@ class MainWindow(
         main_layout.addWidget(bottom_splitter)
 
         # Status
-        self.status_bar = SplatsDBStatusBar()
+        self.status_bar = SplatDBStatusBar()
         self.setStatusBar(self.status_bar)
 
         self._refresh_engine_list()

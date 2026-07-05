@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: GPL-3.0
-"""Config Editor — full SplatsDB configuration editor.
+"""Config Editor — full SplatDB configuration editor.
 
 Shows ALL 60+ config parameters grouped by category.
 Supports preset loading and custom editing.
@@ -17,7 +17,7 @@ from splatsdb_ui.engine_manager import CONFIG_FIELDS, PRESETS
 
 
 class ConfigEditor(QWidget):
-    """Full SplatsDB configuration editor — all parameters."""
+    """Full SplatDB configuration editor — all parameters."""
 
     config_changed = Signal(dict)
     preset_selected = Signal(str)

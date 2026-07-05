@@ -5,7 +5,7 @@ Each vector node is rendered as a true Gaussian Splat — a soft, organic blob
 with alpha blending that merges naturally with neighboring splats.
 
 Instead of spheres/points, we use textured billboards with a 2D Gaussian falloff.
-This matches SplatsDB's core concept: vector data stored as Gaussian Splats.
+This matches SplatDB's core concept: vector data stored as Gaussian Splats.
 """
 
 from __future__ import annotations

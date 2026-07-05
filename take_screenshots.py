@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Take screenshots of SplatsDB UI views."""
+"""Take screenshots of SplatDB UI views."""
 
 import sys
 import os

@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: GPL-3.0
 """EBM Energy Landscape — QPainter-based energy landscape visualization.
 
-Mathematics (ported from SplatsDB Rust backend):
+Mathematics (ported from SplatDB Rust backend):
   Energy:        E(x) = -log(Σᵢ αᵢ · exp(-κᵢ · ||x - μᵢ||²))
   Confidence:    C(x) = 1 / (1 + E(x))
   Gradient:      ∇E(x) = Σᵢ [2κᵢαᵢexp(-κᵢd²)(x-μᵢ)] / Σᵢ [αᵢexp(-κᵢd²)]
