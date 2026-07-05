@@ -129,7 +129,6 @@ def extract_contours(density: np.ndarray, threshold: float):
     Returns list of QPainterPath objects.
     """
     h, w = density.shape
-    paths = []
     segments = []
 
     for i in range(h - 1):
@@ -430,7 +429,6 @@ class ClusterCanvas(QWidget):
 
         # Contour lines
         if self.show_contours:
-            gr = self._grid_res
             for color, level, path in self._contour_paths:
                 # Scale path from grid coords to screen coords
                 screen_path = QPainterPath()

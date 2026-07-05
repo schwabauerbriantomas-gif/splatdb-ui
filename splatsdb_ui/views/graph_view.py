@@ -399,7 +399,6 @@ class ForceLayoutEngine:
                 perp_y = dx / d
 
                 n_edges = len(edge_indices)
-                total_weight = sum(self.edges[ei].weight for ei in edge_indices)
                 spread = d * 0.15  # Total spread distance
 
                 for rank, ei in enumerate(edge_indices):

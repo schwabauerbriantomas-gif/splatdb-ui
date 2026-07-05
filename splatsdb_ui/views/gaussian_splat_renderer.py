@@ -69,9 +69,8 @@ class GaussianSplatItem(gl.GLGraphicsItem.GLGraphicsItem):
         glHint(GL_POINT_SMOOTH_HINT, GL_NICEST)
         glDisable(GL_DEPTH_TEST)  # Splats should layer softly
 
-        # Get modelview and projection matrices for billboard calculations
+        # Get modelview matrix for billboard calculations
         modelview = glGetDoublev(GL_MODELVIEW_MATRIX)
-        projection = glGetDoublev(GL_PROJECTION_MATRIX)
 
         n_splats = len(self._positions)
         default_size = 12.0

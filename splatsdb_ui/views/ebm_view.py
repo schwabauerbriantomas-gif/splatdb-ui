@@ -598,8 +598,6 @@ class EBMCanvas(QWidget):
 
         for i in range(res):
             for j in range(res):
-                # Normalize energy to [0,1]
-                t = (grid[i, j] - e_min) / (e_max - e_min)
                 color = self._energy_to_color(grid[i, j])
                 img.setPixelColor(j, i, color)
 
@@ -718,7 +716,6 @@ class EBMCanvas(QWidget):
             return
 
         # Find high energy points
-        xr, yr = self._grid_x_range, self._grid_y_range
         high_e_points = []
         for i, mu in enumerate(self._engine.mu):
             e = self._engine.energy(mu)
@@ -996,8 +993,8 @@ class EBMCanvas(QWidget):
         painter.drawText(w - 187, 22, "EBM ENERGY LANDSCAPE")
         painter.setPen(QColor(Colors.TEXT_DIM))
         painter.drawText(w - 187, 35, f"Splats: {n_splats}  Free E: {fe:.3f}")
-        painter.drawText(w - 187, 48, f"E(x) = -ln(Σ α·exp(-κ||x-μ||²))")
-        painter.drawText(w - 187, 61, f"C(x) = 1/(1+E(x))")
+        painter.drawText(w - 187, 48, "E(x) = -ln(Σ α·exp(-κ||x-μ||²))")
+        painter.drawText(w - 187, 61, "C(x) = 1/(1+E(x))")
 
     # --- Mouse ---
 

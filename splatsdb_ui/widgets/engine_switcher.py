@@ -97,12 +97,12 @@ class EngineSwitcher(QWidget):
     def _style_power(self, running: bool):
         if running:
             self.power_btn.setIcon(icon("stop", "#fca5a5"))
-            self.power_btn.setStyleSheet(f"""
-                QPushButton {{
+            self.power_btn.setStyleSheet("""
+                QPushButton {
                     background-color: #991b1b; border: none;
                     border-radius: 6px;
-                }}
-                QPushButton:hover {{ background-color: #b91c1c; }}
+                }
+                QPushButton:hover { background-color: #b91c1c; }
             """)
         else:
             self.power_btn.setIcon(icon("play", Colors.BG))

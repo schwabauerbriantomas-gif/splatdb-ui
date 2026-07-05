@@ -70,7 +70,7 @@ def create_engine(
             engine.register_model(info)
 
     # Auto-discover any other models in models_dir
-    discovered = engine.auto_discover()
+    engine.auto_discover()
 
     # Load custom model registrations from config
     if config_path and Path(config_path).exists():

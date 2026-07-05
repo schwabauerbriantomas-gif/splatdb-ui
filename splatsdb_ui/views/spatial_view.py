@@ -275,8 +275,8 @@ class SpatialLayoutEngine:
         c_range[c_range < 0.01] = 1.0
         normed = (centroids - c_min) / c_range * 600 + 100
 
-        # Bounding box for Voronoi
-        bbox = np.array([[0, 0], [800, 0], [800, 700], [0, 700]])
+        # Bounding box for Voronoi (mirror points create finite regions)
+        # bbox intentionally unused — Voronoi uses mirrored points directly
 
         # Mirror points to create finite Voronoi regions
         mirrored = np.vstack([
@@ -710,7 +710,7 @@ class SpatialCanvas(QWidget):
         mst_count = sum(1 for c in self.engine.corridors if c.is_mst)
         delaunay_count = sum(1 for c in self.engine.corridors if c.is_delaunay)
         painter.drawText(x0 + 5, y0 + 36, f"MST: {mst_count}  Delaunay: {delaunay_count}")
-        painter.drawText(x0 + 5, y0 + 48, f"Layout: Voronoi/Delaunay")
+        painter.drawText(x0 + 5, y0 + 48, "Layout: Voronoi/Delaunay")
 
         painter.setPen(QPen(QColor(Colors.ACCENT), 1.5))
         painter.drawLine(x0, y0, x0 + bw, y0)
@@ -799,11 +799,6 @@ class SpatialControls(QWidget):
         self.flow_btn.toggled.connect(self._on_flow_toggled)
         layout.addWidget(self.flow_btn)
 
-    def _on_flow_toggled(self):
-        """Handle flow toggle — regenerate the view."""
-        if hasattr(self, "_regenerate"):
-            self._regenerate()
-
         # Regenerate
         gen_btn = QPushButton("Regenerate")
         gen_btn.setStyleSheet(f"""
@@ -828,6 +823,10 @@ class SpatialControls(QWidget):
             background-color: {Colors.BG_RAISED};
             QLabel {{ color: {Colors.TEXT}; font-size: 11px; }}
         """)
+
+    def _on_flow_toggled(self):
+        """Handle flow toggle — notify parent to regenerate."""
+        self.generate_requested.emit()
 
 
 # ---------------------------------------------------------------------------
