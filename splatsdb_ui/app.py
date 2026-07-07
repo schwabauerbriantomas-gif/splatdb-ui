@@ -17,7 +17,7 @@ from PySide6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout,
     QSplitter, QTabWidget, QMenu,
 )
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, QTimer
 from PySide6.QtGui import QAction, QKeySequence, QShortcut
 
 from splatsdb_ui.utils.signals import SignalBus
@@ -152,10 +152,13 @@ class MainWindow(
 
         # Right: params
         self.param_panel = ParamPanel()
-        self.param_panel.setMaximumWidth(300)
-        self.param_panel.setMinimumWidth(200)
+        self.param_panel.setMaximumWidth(280)
+        self.param_panel.setMinimumWidth(220)
         content_splitter.addWidget(self.param_panel)
-        content_splitter.setSizes([1100, 240])
+        content_splitter.setSizes([1150, 250])
+
+        # Populate params for the initial tab
+        QTimer.singleShot(0, lambda: self._sync_param_panel(0))
 
         # Bottom: IO tray + jobs
         bottom_splitter = QSplitter(Qt.Horizontal)
@@ -189,12 +192,24 @@ class MainWindow(
         self.signals.status_message.connect(self.status_bar.show_message)
         self.signals.search_requested.connect(self.execute_global_search)
 
+        # Parameter panel -> active view
+        self.param_panel.params_applied.connect(self._on_params_applied)
+
         # 3D Explorer connections
         self.splat3d.node_selected.connect(self._on_node_selected)
         self.node_inspector.navigate_to_node.connect(self._on_navigate_to_node)
         self.node_inspector.preview_file_requested.connect(self.file_preview.preview_file)
         self.node_inspector.open_file_requested.connect(self._open_file_external)
         self.file_preview.open_external_requested.connect(self._open_file_external)
+
+    def _on_params_applied(self, params: dict):
+        """Handle parameter changes from the ParamPanel."""
+        for view_id, values in params.items():
+            view = self._views.get(view_id)
+            if view is not None and hasattr(view, "apply_params"):
+                view.apply_params(values)
+            else:
+                self.signals.status_message.emit(f"Applied {len(values)} parameters to {view_id}")
 
     def _on_node_selected(self, node_id: str):
         """When a node is selected in 3D view, load it in inspector."""
@@ -374,23 +389,39 @@ class MainWindow(
     def _build_shortcuts(self):
         QShortcut(QKeySequence("Ctrl+K"), self, self.search_bar.focus_search)
 
-    def switch_view(self, view_id: str):
-        if view_id in self._views:
-            for i in range(self.view_tabs.count()):
-                text = self.view_tabs.tabText(i)
-                if view_id == "explorer" and "3D" in text:
-                    self.view_tabs.setCurrentIndex(i)
-                    return
-            # Check by view object
-            for key, view in self._views.items():
-                if key == view_id:
-                    idx = self.view_tabs.indexOf(view if isinstance(view, QWidget) else self.view_tabs)
-                    if idx >= 0:
-                        self.view_tabs.setCurrentIndex(idx)
-                        return
-
     def _on_tab_changed(self, index: int):
-        pass
+        """Sync parameter panel when the user switches tabs."""
+        self._sync_param_panel(index)
+
+    def _sync_param_panel(self, tab_index: int):
+        """Populate the parameter panel based on the active tab's view."""
+        widget = self.view_tabs.widget(tab_index)
+        if widget is None:
+            return
+
+        # Find which view_id corresponds to this widget
+        view_id = None
+        for key, view in self._views.items():
+            if view is widget:
+                view_id = key
+                break
+
+        if view_id is None:
+            self.param_panel.set_params_from_view("", None)
+            return
+
+        # The explorer tab is a QSplitter (not a view with get_params)
+        view_obj = widget if hasattr(widget, "get_params") else None
+        self.param_panel.set_params_from_view(view_id, view_obj)
+
+    def switch_view(self, view_id: str):
+        """Switch to a view by its ID (e.g. 'search', 'graph')."""
+        if view_id not in self._views:
+            return
+        view = self._views[view_id]
+        idx = self.view_tabs.indexOf(view if isinstance(view, QWidget) else self.view_tabs)
+        if idx >= 0:
+            self.view_tabs.setCurrentIndex(idx)
 
     def _refresh_engine_list(self):
         engines = self.engine_manager.list_engines()

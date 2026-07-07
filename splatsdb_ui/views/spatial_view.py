@@ -628,16 +628,20 @@ class SpatialCanvas(QWidget):
                                  int(v[0] + d_next[0]), int(v[1] + d_next[1]))
 
             # --- Room label ---
-            painter.setPen(QPen(QColor(Colors.BG).lighter(180)))
-            painter.setFont(QFont("sans-serif", 10, QFont.Bold))
+            painter.setPen(QPen(QColor(Colors.TEXT)))
+            painter.setFont(QFont("sans-serif", 11, QFont.Bold))
             text = room.label[:18]
-            painter.drawText(int(center[0] - 40), int(center[1] - 8), text)
+            fm = painter.fontMetrics()
+            tw = fm.horizontalAdvance(text)
+            painter.drawText(int(center[0] - tw / 2), int(center[1] - 8), text)
 
             # --- Member count ---
             painter.setPen(QPen(QColor(Colors.TEXT_DIM)))
-            painter.setFont(QFont("sans-serif", 8))
-            painter.drawText(int(center[0] - 20), int(center[1] + 10),
-                             f"{len(room.members)} splats")
+            painter.setFont(QFont("sans-serif", 9))
+            count_text = f"{len(room.members)} splats"
+            fm2 = painter.fontMetrics()
+            cw = fm2.horizontalAdvance(count_text)
+            painter.drawText(int(center[0] - cw / 2), int(center[1] + 10), count_text)
 
             # --- Area annotation ---
             area_px = room.area

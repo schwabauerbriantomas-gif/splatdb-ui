@@ -523,21 +523,22 @@ class ClusterCanvas(QWidget):
 
                 # Label with background
                 label = f"C{k}"
-                painter.setFont(QFont("monospace", 9, QFont.Bold))
+                painter.setFont(QFont("monospace", 10, QFont.Bold))
                 fm = painter.fontMetrics()
                 tw = fm.horizontalAdvance(label)
                 th = fm.height()
 
                 bg = QColor(Colors.BG)
-                bg.setAlpha(180)
-                painter.fillRect(int(cx + 10), int(cy - th), tw + 6, th + 2, bg)
+                bg.setAlpha(220)
+                painter.setPen(Qt.NoPen)
+                painter.drawRoundedRect(int(cx + 10), int(cy - th), tw + 8, th + 4, 4, 4)
 
-                painter.setPen(QPen(color))
-                painter.drawText(int(cx + 13), int(cy - 2), label)
+                painter.setPen(QPen(color.lighter(130)))
+                painter.drawText(int(cx + 14), int(cy - 2), label)
 
-                painter.setFont(QFont("sans-serif", 7))
+                painter.setFont(QFont("sans-serif", 8))
                 painter.setPen(QPen(QColor(Colors.TEXT_DIM)))
-                painter.drawText(int(cx + 13), int(cy + 10), f"n={n_k}")
+                painter.drawText(int(cx + 14), int(cy + 10), f"n={n_k}")
 
         # Inter-cluster arcs
         self._paint_connections(painter)
@@ -607,32 +608,50 @@ class ClusterCanvas(QWidget):
 class ClusterStatsPanel(QWidget):
     def __init__(self):
         super().__init__()
-        self.setFixedWidth(280)
+        self.setFixedWidth(300)
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(8, 8, 8, 8)
+        layout.setContentsMargins(12, 12, 12, 12)
+        layout.setSpacing(8)
 
         title = QLabel("CLUSTER TOPOLOGY")
         title.setStyleSheet(
-            f"color: {Colors.ACCENT}; font-size: 10px; font-weight: 700; letter-spacing: 1px;"
+            f"color: {Colors.ACCENT}; font-size: 10px; font-weight: 700; letter-spacing: 1.2px;"
         )
         layout.addWidget(title)
 
         self.tree = QTreeWidget()
-        self.tree.setHeaderLabels(["Cluster", "n", "σ", "ρ"])
+        self.tree.setHeaderLabels(["Cluster", "Count", "Spread", "Density"])
         self.tree.header().setStretchLastSection(True)
         self.tree.header().setSectionResizeMode(0, QHeaderView.Stretch)
+        self.tree.setAlternatingRowColors(True)
         self.tree.setStyleSheet(f"""
             QTreeWidget {{
                 background-color: {Colors.BG}; border: 1px solid {Colors.BORDER};
-                border-radius: 6px; color: {Colors.TEXT}; font-size: 11px;
+                border-radius: 8px; color: {Colors.TEXT}; font-size: 11px;
+            }}
+            QTreeWidget::item {{
+                padding: 6px 8px; border-bottom: 1px solid {Colors.BG_RAISED};
             }}
             QHeaderView::section {{
                 background-color: {Colors.BG_RAISED}; color: {Colors.TEXT_DIM};
-                border: none; padding: 4px; font-size: 10px;
+                border: none; border-bottom: 1px solid {Colors.BORDER}; padding: 6px 8px;
+                font-size: 10px; font-weight: 600; text-transform: uppercase;
+                letter-spacing: 0.5px;
             }}
         """)
         layout.addWidget(self.tree)
-        self.setStyleSheet(f"background-color: {Colors.BG_RAISED};")
+
+        # Info label
+        self.info = QLabel("")
+        self.info.setStyleSheet(f"color: {Colors.TEXT_MUTED}; font-size: 10px; padding-top: 4px;")
+        layout.addWidget(self.info)
+
+        self.setStyleSheet(f"""
+            ClusterStatsPanel {{
+                background-color: {Colors.BG_RAISED};
+                border-left: 1px solid {Colors.BORDER};
+            }}
+        """)
 
     def update_stats(self, labels, centroids, covariances):
         self.tree.clear()

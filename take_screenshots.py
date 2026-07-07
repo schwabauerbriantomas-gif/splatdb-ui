@@ -3,9 +3,10 @@
 
 import sys
 import os
+import time
 
 os.environ["QT_QPA_PLATFORM"] = "offscreen"
-os.environ["SPLATSDB_NO_GL"] = "1"  # Disable 3D for headless
+os.environ["SPLATSDB_NO_GL"] = "1"
 
 from PySide6.QtWidgets import QApplication
 from PySide6.QtCore import QTimer
@@ -14,42 +15,49 @@ from PySide6.QtCore import QTimer
 def main():
     app = QApplication(sys.argv)
     from splatsdb_ui.utils.theme import load_theme
-    load_theme()
+    app.setStyleSheet(load_theme())
 
     from splatsdb_ui.app import MainWindow
 
     window = MainWindow()
     window.show()
 
+    # Correct tab indices (matches app.py order):
+    # 0=explorer, 1=welcome, 2=search, 3=collections, 4=graph,
+    # 5=spatial, 6=cluster, 7=ebm, 8=benchmark, 9=ocr, 10=config
     views = [
-        (0, "explorer"),
         (1, "welcome"),
         (2, "search"),
         (3, "collections"),
         (4, "graph"),
         (5, "spatial"),
         (6, "cluster"),
-        (7, "benchmark"),
-        (8, "ocr"),
-        (9, "config"),
+        (7, "ebm"),
+        (8, "benchmark"),
+        (9, "ocr"),
+        (10, "config"),
     ]
 
     def capture():
-        import time
-
-        # Load inspector with demo data for explorer tab screenshot
+        # Load inspector with demo data for explorer tab
         try:
+            window.view_tabs.setCurrentIndex(0)
+            app.processEvents()
+            time.sleep(0.3)
             if "node_000" in window.splat3d._nodes:
                 window.node_inspector.load_node(window.splat3d._nodes["node_000"])
-                window.file_preview.preview_file(
-                    "/mnt/d/splatsdb-ui/splatsdb_ui/resources/icons/search.svg")
+                app.processEvents()
                 time.sleep(0.2)
-        except Exception:
-            pass
+            pixmap = window.grab()
+            pixmap.save("/tmp/splatsdb_ui_explorer.png")
+            print(f"Screenshot explorer: {pixmap.width()}x{pixmap.height()}")
+        except Exception as e:
+            print(f"Explorer error: {e}")
 
         for idx, name in views:
             window.view_tabs.setCurrentIndex(idx)
-            time.sleep(0.15)
+            app.processEvents()
+            time.sleep(0.4)
             pixmap = window.grab()
             path = f"/tmp/splatsdb_ui_{name}.png"
             pixmap.save(path)
@@ -58,7 +66,7 @@ def main():
         print("All screenshots taken!")
         app.quit()
 
-    QTimer.singleShot(500, capture)
+    QTimer.singleShot(800, capture)
     sys.exit(app.exec())
 
 

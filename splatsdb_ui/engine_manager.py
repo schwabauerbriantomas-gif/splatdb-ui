@@ -488,8 +488,8 @@ class EngineManager(QObject):
             "splatsdb",
             "/usr/local/bin/splatsdb",
             "/usr/bin/splatsdb",
-            "/mnt/d/splatdb/target/release/splatsdb",
-            "/mnt/d/splatdb/target/debug/splatsdb",
+            str(Path.home() / "splatsdb/target/release/splatsdb"),
+            str(Path.home() / "splatsdb/target/debug/splatsdb"),
             str(Path.home() / ".cargo/bin/splatsdb"),
         ]:
             if Path(candidate).exists() or shutil.which(candidate):

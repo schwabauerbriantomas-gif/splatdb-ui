@@ -65,7 +65,7 @@ class EmbeddingProvider(ABC):
 class NemotronProvider(EmbeddingProvider):
     """llama-embed-nemotron-8b — NVIDIA's 8B embedding model.
 
-    Loads from local path (e.g. /mnt/d/models/llama-embed-nemotron-8b).
+    Loads from a local path (e.g. ~/models/llama-embed-nemotron-8b).
     Uses PyTorch + Transformers. Supports CUDA and CPU.
     """
 
@@ -255,21 +255,21 @@ class EmbeddingEngine:
     """Central embedding engine — manages multiple models, switches at runtime.
 
     Usage:
-        engine = EmbeddingEngine(models_dir="/mnt/d/models")
+        engine = EmbeddingEngine()
         engine.register_model(ModelInfo(
             name="nemotron-8b",
             display_name="LLaMA-Embed Nemotron 8B",
             dimension=4096,
             provider="nemotron",
-            path="/mnt/d/models/llama-embed-nemotron-8b",
+            path="llama-embed-nemotron-8b",
             size_gb=16.0,
         ))
         engine.set_active("nemotron-8b")
         vectors = engine.encode(["Hello world", "Vector search"])
     """
 
-    def __init__(self, models_dir: str = "/mnt/d/models"):
-        self._models_dir = Path(models_dir)
+    def __init__(self, models_dir: str = ""):
+        self._models_dir = Path(models_dir) if models_dir else Path.home() / "models"
         self._registry: dict[str, ModelInfo] = {}
         self._providers: dict[str, EmbeddingProvider] = {}
         self._active: Optional[str] = None

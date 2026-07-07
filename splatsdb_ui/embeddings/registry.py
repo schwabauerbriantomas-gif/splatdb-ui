@@ -27,7 +27,7 @@ KNOWN_MODELS = {
         display_name="LLaMA-Embed Nemotron 8B (NVIDIA)",
         dimension=4096,
         provider="nemotron",
-        path="/mnt/d/models/llama-embed-nemotron-8b",
+        path="llama-embed-nemotron-8b",
         size_gb=16.0,
     ),
     "all-MiniLM-L6-v2": ModelInfo(
@@ -58,7 +58,7 @@ KNOWN_MODELS = {
 
 
 def create_engine(
-    models_dir: str = "/mnt/d/models",
+    models_dir: str = "",
     config_path: Optional[str] = None,
 ) -> EmbeddingEngine:
     """Create and configure the embedding engine with discovered models."""

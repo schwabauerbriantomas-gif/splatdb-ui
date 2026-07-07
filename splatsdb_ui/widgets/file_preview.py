@@ -50,7 +50,7 @@ class FilePreview(QWidget):
         ext_btn.setIcon(icon("link", Colors.TEXT_DIM))
         ext_btn.setFixedSize(24, 24)
         ext_btn.setToolTip("Open externally")
-        ext_btn.setStyleSheet("QPushButton { background: transparent; border: none; } QPushButton:hover { background-color: #21262d; border-radius: 4px; }")
+        ext_btn.setStyleSheet(f"QPushButton {{ background: transparent; border: none; border-radius: 6px; }} QPushButton:hover {{ background-color: {Colors.BG_OVERLAY}; }}")
         ext_btn.clicked.connect(self._open_external)
         header.addWidget(ext_btn)
 

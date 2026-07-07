@@ -26,8 +26,12 @@ class OCRView(QWidget):
 
         header = QHBoxLayout()
         title = QLabel("OCR Pipeline")
-        title.setStyleSheet(f"color: {Colors.TEXT}; font-size: 18px; font-weight: 700;")
+        title.setStyleSheet(f"color: {Colors.TEXT}; font-size: 20px; font-weight: 700; letter-spacing: -0.3px;")
         header.addWidget(title)
+
+        subtitle = QLabel("Image / PDF to searchable text")
+        subtitle.setStyleSheet(f"color: {Colors.TEXT_DIM}; font-size: 12px; padding-top: 4px;")
+        header.addWidget(subtitle)
         header.addStretch()
         layout.addLayout(header)
 
@@ -74,9 +78,9 @@ class OCRView(QWidget):
         preview = QFrame()
         pl = QVBoxLayout(preview)
         pl.setContentsMargins(0, 0, 0, 0)
-        self.preview_label = QLabel("No file loaded")
+        self.preview_label = QLabel("Select a file to preview")
         self.preview_label.setAlignment(Qt.AlignCenter)
-        self.preview_label.setStyleSheet(f"color: {Colors.TEXT_MUTED};")
+        self.preview_label.setStyleSheet(f"color: {Colors.TEXT_DIM}; font-size: 13px;")
         pl.addWidget(self.preview_label)
         splitter.addWidget(preview)
 

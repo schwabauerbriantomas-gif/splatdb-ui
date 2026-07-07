@@ -53,7 +53,7 @@ class NodeInspector(QWidget):
         self.close_btn = QPushButton()
         self.close_btn.setIcon(icon("cross", Colors.TEXT_DIM))
         self.close_btn.setFixedSize(24, 24)
-        self.close_btn.setStyleSheet("QPushButton { background: transparent; border: none; } QPushButton:hover { background-color: #21262d; border-radius: 4px; }")
+        self.close_btn.setStyleSheet(f"QPushButton {{ background: transparent; border: none; border-radius: 6px; }} QPushButton:hover {{ background-color: {Colors.BG_OVERLAY}; }}")
         self.close_btn.clicked.connect(self.hide)
         header.addWidget(self.close_btn)
 

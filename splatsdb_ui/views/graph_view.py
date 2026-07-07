@@ -62,7 +62,7 @@ _PALETTE = [
 def _node_color(idx: int) -> QColor:
     """Generate color via golden-ratio hue spacing."""
     hue = (idx * (1.0 / PHI)) % 1.0
-    r, g, b = colorsys.hsv_to_rgb(hue, 0.65, 0.88)
+    r, g, b = colorsys.hsv_to_rgb(hue, 0.70, 0.92)
     return QColor(int(r * 255), int(g * 255), int(b * 255))
 
 
@@ -604,11 +604,11 @@ class GraphCanvas(QWidget):
             blend = _lerp_color(ni.color, nj.color, 0.5)
 
             if is_dim:
-                alpha = 15
+                alpha = 20
             elif is_highlighted:
-                alpha = int(80 + edge.weight * 140)
+                alpha = int(120 + edge.weight * 120)
             else:
-                alpha = int(25 + edge.weight * 60)
+                alpha = int(50 + edge.weight * 90)
 
             # Draw with alpha gradient (stronger at endpoints, lighter at mid)
             # Use QLinearGradient along the edge for the alpha fade
@@ -742,13 +742,15 @@ class GraphCanvas(QWidget):
             painter.drawEllipse(QPointF(ax, ay), r, r)
 
             # --- Label ---
-            if r >= 6 and (is_hovered or is_selected or
-                           node.degree >= 2 or len(nodes) <= 40):
-                label = node.label[:16]
-                font_size = max(7, min(11, int(r * 0.7)))
-                painter.setFont(QFont("sans-serif", font_size, QFont.Medium))
+            # Only show labels for hovered/selected nodes, or very high-degree nodes
+            # This prevents label overlap when many nodes are visible
+            show_label = (is_hovered or is_selected or node.degree >= 6)
+            if show_label and r >= 6:
+                label = node.label[:18]
+                font_size = max(8, min(11, int(r * 0.7)))
+                painter.setFont(QFont("sans-serif", font_size, QFont.DemiBold))
 
-                # Label background
+                # Label background — high opacity for readability
                 fm = painter.fontMetrics()
                 tw = fm.horizontalAdvance(label)
                 th = fm.height()
@@ -756,9 +758,17 @@ class GraphCanvas(QWidget):
                 ly = ay + r + 4
 
                 bg = QColor(Colors.BG)
-                bg.setAlpha(160)
-                painter.fillRect(int(lx - 3), int(ly - th + 2),
-                                 tw + 6, th + 2, bg)
+                bg.setAlpha(230)
+                painter.setPen(Qt.NoPen)
+                painter.drawRoundedRect(int(lx - 5), int(ly - th + 1),
+                                        tw + 10, th + 4, 4, 4)
+
+                # Accent border on hovered/selected label
+                if is_hovered or is_selected:
+                    painter.setPen(QPen(QColor(Colors.ACCENT), 1.0))
+                    painter.setBrush(Qt.NoBrush)
+                    painter.drawRoundedRect(int(lx - 5), int(ly - th + 1),
+                                            tw + 10, th + 4, 4, 4)
 
                 text_color = QColor(Colors.TEXT) if (
                     is_hovered or is_selected) else QColor(Colors.TEXT_DIM)

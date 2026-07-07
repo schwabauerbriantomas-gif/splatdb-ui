@@ -60,4 +60,4 @@ class AppState:
 
     # Config file path
     config_dir: Path = field(default_factory=lambda: Path.home() / ".splatsdb-ui")
-    models_dir: Path = field(default_factory=lambda: Path("/mnt/d/models"))
+    models_dir: Path = field(default_factory=lambda: Path.home() / "models")
