@@ -2,7 +2,7 @@
 """Engine Switcher — LM Studio-style backend selector."""
 
 from PySide6.QtWidgets import QWidget, QHBoxLayout, QLabel, QPushButton, QComboBox
-from PySide6.QtCore import Signal
+from PySide6.QtCore import Signal, QPropertyAnimation, QEasingCurve
 
 from splatsdb_ui.engine_manager import EngineStatus
 from splatsdb_ui.utils.icons import icon, icon_accent, icon_error, icon_success
@@ -15,6 +15,14 @@ DOT_COLORS = {
     EngineStatus.RUNNING:  Colors.SUCCESS,
     EngineStatus.ERROR:    Colors.ERROR,
 }
+
+
+_DOT_STYLE_TEMPLATE = """
+    QLabel {{
+        background-color: {color};
+        border-radius: 5px;
+    }}
+"""
 
 
 class EngineSwitcher(QWidget):
@@ -39,6 +47,14 @@ class EngineSwitcher(QWidget):
         self.status_dot.setFixedSize(10, 10)
         self._set_dot_color(Colors.TEXT_MUTED)
         layout.addWidget(self.status_dot)
+
+        # Pulsing animation for STARTING status
+        self._dot_anim = QPropertyAnimation(self.status_dot, b"windowOpacity")
+        self._dot_anim.setDuration(1000)
+        self._dot_anim.setStartValue(1.0)
+        self._dot_anim.setEndValue(0.3)
+        self._dot_anim.setEasingCurve(QEasingCurve.InOutSine)
+        self._dot_anim.setLoopCount(-1)  # infinite
 
         # Engine combo
         self.engine_combo = QComboBox()
@@ -66,6 +82,12 @@ class EngineSwitcher(QWidget):
         self.add_btn.setFixedSize(30, 30)
         self.add_btn.setToolTip("Add engine")
         self.add_btn.clicked.connect(self.add_requested.emit)
+        self.add_btn.setStyleSheet(f"""
+            QPushButton {{
+                background: transparent; border: none; border-radius: 6px;
+            }}
+            QPushButton:hover {{ background-color: {Colors.BG_OVERLAY}; }}
+        """)
         layout.addWidget(self.add_btn)
 
         # Settings
@@ -88,10 +110,7 @@ class EngineSwitcher(QWidget):
         """)
 
     def _set_dot_color(self, color: str):
-        self.status_dot.setStyleSheet(f"""
-            background-color: {color};
-            border-radius: 5px;
-        """)
+        self.status_dot.setStyleSheet(_DOT_STYLE_TEMPLATE.format(color=color))
 
     def _style_power(self, running: bool):
         if running:
@@ -117,10 +136,11 @@ class EngineSwitcher(QWidget):
         self.engine_combo.blockSignals(True)
         self.engine_combo.clear()
         for eng in engines:
-            self.engine_combo.addItem(f"{eng.name}  ({eng.engine_type})", eng)
+            display = f"{eng.name}  ({eng.engine_type})"
+            self.engine_combo.addItem(display, eng.name)
         if active_name:
             for i in range(self.engine_combo.count()):
-                if active_name in self.engine_combo.itemText(i):
+                if self.engine_combo.itemData(i) == active_name:
                     self.engine_combo.setCurrentIndex(i)
                     break
         self.engine_combo.blockSignals(False)
@@ -130,12 +150,20 @@ class EngineSwitcher(QWidget):
         self._set_dot_color(color)
         self._style_power(status == EngineStatus.RUNNING)
         self.power_btn.setEnabled(status != EngineStatus.STARTING)
+        if status == EngineStatus.STARTING:
+            self._dot_anim.start()
+        else:
+            self._dot_anim.stop()
+            self.status_dot.setWindowOpacity(1.0)
 
     def _on_engine_changed(self, text: str):
-        if text:
-            self.engine_selected.emit(text.split("  ")[0])
+        idx = self.engine_combo.currentIndex()
+        name = self.engine_combo.itemData(idx)
+        if name:
+            self.engine_selected.emit(name)
 
     def _on_power(self):
-        name = self.engine_combo.currentText().split("  ")[0]
+        idx = self.engine_combo.currentIndex()
+        name = self.engine_combo.itemData(idx)
         if name:
             self.start_requested.emit(name)

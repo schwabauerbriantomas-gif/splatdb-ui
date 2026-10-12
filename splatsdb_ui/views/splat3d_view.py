@@ -20,17 +20,19 @@ from __future__ import annotations
 
 import math
 import random
+import time
 import numpy as np
 from typing import Optional
 
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
-    QComboBox, QSlider, QSizePolicy,
+    QComboBox, QSlider, QSizePolicy, QCheckBox,
 )
 from PySide6.QtCore import Signal, Qt, QTimer, QPointF
 from PySide6.QtGui import (
     QPainter, QColor, QPen, QBrush, QFont,
     QRadialGradient, QLinearGradient, QPainterPath, QPolygonF,
+    QConicalGradient, QCursor,
 )
 
 from splatsdb_ui.utils.theme import Colors
@@ -199,6 +201,11 @@ class Splat3DCanvas(QWidget):
         self._drag_start = None
         self._pan_start = None
 
+        # Connection rendering cache
+        self._conn_cache_paths: list | None = None
+        self._conn_cache_pens: list | None = None
+        self._conn_cache_key: tuple | None = None
+
         # Animation
         self._anim_time = 0.0
         self._timer = QTimer(self)
@@ -214,6 +221,25 @@ class Splat3DCanvas(QWidget):
                 rng.randint(10, 35), rng.uniform(0.5, 1.5)
             ))
 
+        # Camera inertia (smooth drift after mouse release)
+        self._inertia_az = 0.0
+        self._inertia_el = 0.0
+        self._inertia_pan_x = 0.0
+        self._inertia_pan_y = 0.0
+        self._inertia_decay = 0.92
+        self._last_drag_dx = 0.0
+        self._last_drag_dy = 0.0
+        self._last_pan_dx = 0.0
+        self._last_pan_dy = 0.0
+
+        # FPS counter
+        self._fps = 0.0
+        self._fps_frames = 0
+        self._fps_last_time = time.monotonic()
+
+        # Minimap cached positions (XZ bounds)
+        self._mm_bounds: tuple | None = None
+
     def load_nodes(self, nodes: list[dict]):
         """Load nodes and build splat data."""
         self._splats.clear()
@@ -221,6 +247,7 @@ class Splat3DCanvas(QWidget):
         self._node_map.clear()
         self._hovered = -1
         self._selected = -1
+        self._conn_cache_key = None  # invalidate connection cache
 
         n = len(nodes)
         positions = []
@@ -282,8 +309,19 @@ class Splat3DCanvas(QWidget):
 
         self.update()
 
+        # Pre-compute minimap bounds (XZ plane)
+        if self._splats:
+            positions = np.array([s.position for s in self._splats])
+            x_min, x_max = positions[:, 0].min(), positions[:, 0].max()
+            z_min, z_max = positions[:, 2].min(), positions[:, 2].max()
+            pad = max(x_max - x_min, z_max - z_min, 1.0) * 0.12
+            self._mm_bounds = (x_min - pad, x_max + pad, z_min - pad, z_max + pad)
+        else:
+            self._mm_bounds = None
+
     def set_connection_mode(self, mode: str):
         self._conn_mode = mode
+        self._conn_cache_key = None  # invalidate connection cache
         self.update()
 
     def set_splat_size(self, multiplier: float):
@@ -303,6 +341,32 @@ class Splat3DCanvas(QWidget):
 
     def _tick(self):
         self._anim_time += 0.033
+
+        # FPS counter
+        self._fps_frames += 1
+        now = time.monotonic()
+        elapsed = now - self._fps_last_time
+        if elapsed >= 1.0:
+            self._fps = self._fps_frames / elapsed
+            self._fps_frames = 0
+            self._fps_last_time = now
+
+        # Camera inertia — apply residual velocity when not dragging
+        if self._drag_start is None and self._pan_start is None:
+            if abs(self._inertia_az) > 0.00005 or abs(self._inertia_el) > 0.00005:
+                self.camera.azimuth += self._inertia_az
+                self.camera.elevation += self._inertia_el
+                self.camera.elevation = max(
+                    -math.pi / 2 + 0.1, min(math.pi / 2 - 0.1, self.camera.elevation)
+                )
+                self._inertia_az *= self._inertia_decay
+                self._inertia_el *= self._inertia_decay
+            if abs(self._inertia_pan_x) > 0.00005 or abs(self._inertia_pan_y) > 0.00005:
+                self.camera.pan_x += self._inertia_pan_x
+                self.camera.pan_y += self._inertia_pan_y
+                self._inertia_pan_x *= self._inertia_decay
+                self._inertia_pan_y *= self._inertia_decay
+
         self.update()
 
     # --- Rendering ---
@@ -345,12 +409,24 @@ class Splat3DCanvas(QWidget):
         for i in sorted_indices:
             self._paint_splat(painter, self._splats[i])
 
+        # Lens flare on selected / hovered node
+        active_idx = self._hovered if self._hovered >= 0 else self._selected
+        if active_idx >= 0 and active_idx < len(self._splats):
+            self._paint_lens_flare(painter, self._splats[active_idx], w, h)
+
         # Selection ring
         if 0 <= self._selected < len(self._splats):
             self._paint_selection(painter, self._splats[self._selected])
 
-        # Info overlay
-        self._paint_info(painter, w, h)
+        # Chromatic aberration on viewport edges
+        self._paint_chromatic_aberration(painter, w, h)
+
+        # Pulsing vignette overlay
+        self._paint_pulsing_vignette(painter, w, h)
+
+        # Info overlay — control panel (bottom-left) and minimap (bottom-right)
+        self._paint_control_panel(painter, w, h)
+        self._paint_minimap(painter, w, h)
 
         painter.end()
 
@@ -385,13 +461,13 @@ class Splat3DCanvas(QWidget):
 
     def _paint_axes(self, painter: QPainter, w: int, h: int):
         """3D axis indicator in corner."""
-        origin_x, origin_y = 60, h - 60
+        origin_x, origin_y = 60, 60
         length = 35
 
         for axis, color, label in [
-            (np.array([1, 0, 0]), "#ef4444", "X"),
-            (np.array([0, 1, 0]), "#22c55e", "Y"),
-            (np.array([0, 0, 1]), "#3b82f6", "Z"),
+            (np.array([1, 0, 0]), Colors.AXIS_X, "X"),
+            (np.array([0, 1, 0]), Colors.AXIS_Y, "Y"),
+            (np.array([0, 0, 1]), Colors.AXIS_Z, "Z"),
         ]:
             ca, sa = math.cos(self.camera.azimuth), math.sin(self.camera.azimuth)
             ce, se = math.cos(self.camera.elevation), math.sin(self.camera.elevation)
@@ -410,7 +486,16 @@ class Splat3DCanvas(QWidget):
             painter.drawText(int(ex + 3), int(ey - 3), label)
 
     def _paint_connections(self, painter: QPainter):
-        """Draw connections as alpha-gradient Bézier curves."""
+        """Draw connections as alpha-gradient Bézier curves.
+
+        Optimisations over naïve per-segment approach:
+          1. Viewport culling — skip connections whose AABB is fully off-screen.
+          2. Adaptive segment count — dim connections use 3 segments, normal 6,
+             highlighted 10.  Reduces drawLine calls from 10N to ~4N on average.
+          3. Path caching — when connection list, conn-mode, hover/selection and
+             screen positions haven't changed the pre-built QPainterPaths and pen
+             lists are reused verbatim (zero Bézier recomputation).
+        """
         if not self._splats:
             return
 
@@ -418,13 +503,42 @@ class Splat3DCanvas(QWidget):
         selected = self._selected
         active = hovered if hovered >= 0 else selected
 
-        neighbor_set = set()
+        # --- Build a lightweight fingerprint to decide if we can reuse cache ---
+        # We include the projected screen positions so animated drift invalidates
+        # the cache, but we quantise to 0.5 px so tiny jitter doesn't thrash it.
+        pos_fingerprint = tuple(
+            (int(s.sx * 2), int(s.sy * 2))
+            for s in self._splats
+        )
+        cache_key = (
+            self._conn_mode,
+            active,
+            len(self._connections),
+            pos_fingerprint,
+        )
+
+        if cache_key == self._conn_cache_key and self._conn_cache_paths is not None:
+            # Fast path: replay cached segment/pen pairs — no Bézier math at all
+            for seg_list, pen_list in zip(self._conn_cache_paths, self._conn_cache_pens):
+                for (color, width), (p0, p1) in zip(pen_list, seg_list):
+                    painter.setPen(QPen(color, width, Qt.SolidLine, Qt.RoundCap))
+                    painter.drawLine(p0, p1)
+            return
+
+        # --- Slow path: compute connection geometry from scratch ---
+        w, h = self.width(), self.height()
+        margin = 200  # pixels of off-screen tolerance before culling
+
+        neighbor_set: set[int] = set()
         if active >= 0:
             for i, j, _ in self._connections:
                 if i == active:
                     neighbor_set.add(j)
                 elif j == active:
                     neighbor_set.add(i)
+
+        cached_segments: list[list[tuple[QPointF, QPointF]]] = []
+        cached_pens: list[list[tuple[QColor, float]]] = []
 
         for ci, (i, j, weight) in enumerate(self._connections):
             if i >= len(self._splats) or j >= len(self._splats):
@@ -445,21 +559,31 @@ class Splat3DCanvas(QWidget):
                 if weight < 0.7:
                     continue
 
-            # Draw segmented alpha-gradient curve
             ax, ay = si.sx, si.sy
             bx, by = sj.sx, sj.sy
 
-            # Control point — perpendicular offset for curvature
-            mx, my = (ax + bx) / 2, (ay + by) / 2
-            dx, dy = bx - ax, by - ay
-            length = math.sqrt(dx * dx + dy * dy + 0.01)
-            perp_x, perp_y = -dy / length, dx / length
-            offset = weight * 12
-            cx_pt = mx + perp_x * offset
-            cy_pt = my + perp_y * offset
+            # --- Viewport culling ---
+            # Check bounding box of the two endpoints (conservative; ignores
+            # curve bulge but the margin covers it for typical weights).
+            min_x = min(ax, bx)
+            max_x = max(ax, bx)
+            min_y = min(ay, by)
+            max_y = max(ay, by)
+            if max_x < -margin or min_x > w + margin or max_y < -margin or min_y > h + margin:
+                continue
 
-            # Color blend
+            # Control point — perpendicular offset for curvature
+            mx_c, my_c = (ax + bx) * 0.5, (ay + by) * 0.5
+            dx, dy = bx - ax, by - ay
+            inv_len = 1.0 / math.sqrt(dx * dx + dy * dy + 0.01)
+            perp_x, perp_y = -dy * inv_len, dx * inv_len
+            offset = weight * 12
+            cx_pt = mx_c + perp_x * offset
+            cy_pt = my_c + perp_y * offset
+
+            # Color blend (pre-compute once per connection)
             blend = _lerp_color(si.color, sj.color, 0.5)
+            blend_r, blend_g, blend_b = blend.red(), blend.green(), blend.blue()
 
             if is_dim:
                 alpha_base = 12
@@ -472,23 +596,46 @@ class Splat3DCanvas(QWidget):
             if is_highlighted:
                 base_width *= 1.4
 
-            # Draw segmented with alpha gradient
-            n_seg = 10
+            # Adaptive segment count: fewer segments for dim connections
+            if is_dim:
+                n_seg = 3
+            elif is_highlighted:
+                n_seg = 10
+            else:
+                n_seg = 6
+
+            seg_list: list[tuple[QPointF, QPointF]] = []
+            pen_list: list[tuple[QColor, float]] = []
+
             prev_x, prev_y = ax, ay
             for seg in range(1, n_seg + 1):
                 t = seg / n_seg
-                px = (1 - t) ** 2 * ax + 2 * (1 - t) * t * cx_pt + t ** 2 * bx
-                py = (1 - t) ** 2 * ay + 2 * (1 - t) * t * cy_pt + t ** 2 * by
+                t1 = 1.0 - t
+                px = t1 * t1 * ax + 2 * t1 * t * cx_pt + t * t * bx
+                py = t1 * t1 * ay + 2 * t1 * t * cy_pt + t * t * by
 
                 # Alpha: strongest at endpoints, lightest at midpoint
                 alpha_t = 1.0 - 0.45 * (1.0 - abs(2 * t - 1))
                 seg_alpha = max(5, int(alpha_base * alpha_t))
 
-                pen_color = QColor(blend)
-                pen_color.setAlpha(seg_alpha)
-                painter.setPen(QPen(pen_color, base_width * alpha_t, Qt.SolidLine, Qt.RoundCap))
+                pen_color = QColor(blend_r, blend_g, blend_b, seg_alpha)
+                pen_width = base_width * alpha_t
+
+                painter.setPen(QPen(pen_color, pen_width, Qt.SolidLine, Qt.RoundCap))
                 painter.drawLine(QPointF(prev_x, prev_y), QPointF(px, py))
+
+                seg_list.append((QPointF(prev_x, prev_y), QPointF(px, py)))
+                pen_list.append((pen_color, pen_width))
+
                 prev_x, prev_y = px, py
+
+            cached_segments.append(seg_list)
+            cached_pens.append(pen_list)
+
+        # Store cache
+        self._conn_cache_paths = cached_segments
+        self._conn_cache_pens = cached_pens
+        self._conn_cache_key = cache_key
 
     def _paint_splat(self, painter: QPainter, splat: SplatData):
         """Draw a single Gaussian splat with glow + opaque core."""
@@ -647,6 +794,176 @@ class Splat3DCanvas(QWidget):
                 painter.setPen(QPen(QColor(Colors.TEXT)))
                 painter.drawText(int(lx), int(ly + 2), label)
 
+    # ------------------------------------------------------------------
+    # Post-processing effects: lens flare, chromatic aberration, vignette
+    # ------------------------------------------------------------------
+
+    def _paint_lens_flare(self, painter: QPainter, splat: SplatData,
+                          w: int, h: int):
+        """Anamorphic-style lens flare on the active (hovered/selected) node.
+
+        Renders:
+          1. Central halo — large soft glow ring
+          2. 3 light streaks — thin elongated beams at different angles
+          3. Small secondary ghost — offset towards screen center
+        """
+        sx, sy = splat.sx, splat.sy
+        base = QColor(splat.color)
+        pulse = 0.85 + 0.15 * math.sin(self._anim_time * 2.0)
+        t = self._anim_time
+
+        painter.save()
+        painter.setRenderHint(QPainter.Antialiasing)
+
+        # --- Central halo ---
+        halo_r = max(splat.semi_a, splat.semi_b) * 4.0 * pulse
+        halo_grad = QRadialGradient(QPointF(sx, sy), halo_r)
+        hc = QColor(base); hc.setAlpha(int(55 * pulse))
+        hm = QColor(base); hm.setAlpha(int(25 * pulse))
+        ho = QColor(base); ho.setAlpha(0)
+        halo_grad.setColorAt(0.0, hc)
+        halo_grad.setColorAt(0.35, hm)
+        halo_grad.setColorAt(1.0, ho)
+        painter.setPen(Qt.NoPen)
+        painter.setBrush(QBrush(halo_grad))
+        painter.drawEllipse(QPointF(sx, sy), halo_r, halo_r)
+
+        # --- Light streaks (anamorphic cross) ---
+        streak_len = max(w, h) * 0.38 * pulse
+        streak_half_w = 1.8 * pulse
+
+        streak_angles = [
+            0.0,                             # horizontal
+            math.pi / 2,                     # vertical
+            math.pi / 4 + 0.15 * math.sin(t * 0.7),  # diagonal 1 (animated)
+        ]
+
+        for sa_angle in streak_angles:
+            dx = math.cos(sa_angle)
+            dy = math.sin(sa_angle)
+            x1 = sx - dx * streak_len
+            y1 = sy - dy * streak_len
+            x2 = sx + dx * streak_len
+            y2 = sy + dy * streak_len
+
+            streak_grad = QLinearGradient(QPointF(x1, y1), QPointF(x2, y2))
+            sc1 = QColor(base); sc1.setAlpha(0)
+            sc2 = QColor(base); sc2.setAlpha(int(40 * pulse))
+            sc3 = QColor(base).lighter(140); sc3.setAlpha(int(70 * pulse))
+            streak_grad.setColorAt(0.0, sc1)
+            streak_grad.setColorAt(0.38, sc2)
+            streak_grad.setColorAt(0.5, sc3)
+            streak_grad.setColorAt(0.62, sc2)
+            streak_grad.setColorAt(1.0, sc1)
+
+            painter.setPen(QPen(QBrush(streak_grad), streak_half_w * 2,
+                                Qt.SolidLine, Qt.RoundCap))
+            painter.drawLine(QPointF(x1, y1), QPointF(x2, y2))
+
+        # --- Secondary ghost (small bright spot offset toward center) ---
+        cx, cy = w / 2, h / 2
+        ghost_x = sx + (cx - sx) * 0.25
+        ghost_y = sy + (cy - sy) * 0.25
+        ghost_r = max(splat.semi_a, splat.semi_b) * 1.5 * pulse
+        ghost_grad = QRadialGradient(QPointF(ghost_x, ghost_y), ghost_r)
+        gc = QColor(base).lighter(160); gc.setAlpha(int(35 * pulse))
+        gm = QColor(base); gm.setAlpha(int(12 * pulse))
+        go = QColor(base); go.setAlpha(0)
+        ghost_grad.setColorAt(0.0, gc)
+        ghost_grad.setColorAt(0.5, gm)
+        ghost_grad.setColorAt(1.0, go)
+        painter.setPen(Qt.NoPen)
+        painter.setBrush(QBrush(ghost_grad))
+        painter.drawEllipse(QPointF(ghost_x, ghost_y), ghost_r, ghost_r)
+
+        painter.restore()
+
+    def _paint_chromatic_aberration(self, painter: QPainter, w: int, h: int):
+        """Subtle chromatic aberration — red/blue channel fringing on viewport edges.
+
+        Draws semi-transparent colored strips along the four edges:
+          - Red channel shifted outward (left edge, top edge)
+          - Blue channel shifted outward (right edge, bottom edge)
+        The effect intensity increases toward the corners using a gradient.
+        """
+        # How far the aberration strip extends inward (pixels)
+        strip_w = 18
+        # Max alpha at the very edge
+        max_alpha = 22
+
+        painter.save()
+        painter.setPen(Qt.NoPen)
+
+        # --- Left edge: red fringe ---
+        lg = QLinearGradient(QPointF(0, 0), QPointF(strip_w, 0))
+        lg.setColorAt(0.0, QColor(255, 40, 40, max_alpha))
+        lg.setColorAt(1.0, QColor(255, 40, 40, 0))
+        painter.setBrush(QBrush(lg))
+        painter.drawRect(0, 0, strip_w, h)
+
+        # --- Right edge: blue fringe ---
+        rg = QLinearGradient(QPointF(w, 0), QPointF(w - strip_w, 0))
+        rg.setColorAt(0.0, QColor(40, 60, 255, max_alpha))
+        rg.setColorAt(1.0, QColor(40, 60, 255, 0))
+        painter.setBrush(QBrush(rg))
+        painter.drawRect(w - strip_w, 0, strip_w, h)
+
+        # --- Top edge: blue fringe ---
+        tg = QLinearGradient(QPointF(0, 0), QPointF(0, strip_w))
+        tg.setColorAt(0.0, QColor(40, 60, 255, max_alpha))
+        tg.setColorAt(1.0, QColor(40, 60, 255, 0))
+        painter.setBrush(QBrush(tg))
+        painter.drawRect(0, 0, w, strip_w)
+
+        # --- Bottom edge: red fringe ---
+        bg = QLinearGradient(QPointF(0, h), QPointF(0, h - strip_w))
+        bg.setColorAt(0.0, QColor(255, 40, 40, max_alpha))
+        bg.setColorAt(1.0, QColor(255, 40, 40, 0))
+        painter.setBrush(QBrush(bg))
+        painter.drawRect(0, h - strip_w, w, strip_w)
+
+        # --- Corner reinforcement (subtle radial color spots) ---
+        corner_r = 55
+        for (cx, cy, color) in [
+            (0, 0, QColor(180, 50, 50, 14)),
+            (w, 0, QColor(50, 50, 200, 14)),
+            (0, h, QColor(200, 50, 50, 14)),
+            (w, h, QColor(50, 50, 220, 14)),
+        ]:
+            cg = QRadialGradient(QPointF(cx, cy), corner_r)
+            cg.setColorAt(0.0, color)
+            cc = QColor(color); cc.setAlpha(0)
+            cg.setColorAt(1.0, cc)
+            painter.setBrush(QBrush(cg))
+            painter.drawEllipse(QPointF(cx, cy), corner_r, corner_r)
+
+        painter.restore()
+
+    def _paint_pulsing_vignette(self, painter: QPainter, w: int, h: int):
+        """Slowly pulsing vignette overlay that darkens viewport edges.
+
+        The base static vignette is in `_paint_background`; this adds a
+        breathing layer on top whose alpha oscillates with `_anim_time`.
+        """
+        # Pulse: ~0.25 Hz, amplitude 25 alpha units
+        pulse_alpha = int(25 + 18 * math.sin(self._anim_time * 1.57))
+
+        painter.save()
+        painter.setPen(Qt.NoPen)
+
+        vignette = QRadialGradient(
+            QPointF(w / 2, h / 2),
+            max(w, h) * 0.72,
+        )
+        vignette.setColorAt(0.0, QColor(0, 0, 0, 0))
+        vignette.setColorAt(0.55, QColor(0, 0, 0, 0))
+        vignette.setColorAt(0.85, QColor(0, 0, 0, pulse_alpha // 2))
+        vignette.setColorAt(1.0, QColor(0, 0, 0, pulse_alpha))
+
+        painter.setBrush(QBrush(vignette))
+        painter.drawRect(0, 0, w, h)
+        painter.restore()
+
     def _paint_selection(self, painter: QPainter, splat: SplatData):
         """Dashed ring around selected splat."""
         sx, sy = splat.sx, splat.sy
@@ -662,28 +979,198 @@ class Splat3DCanvas(QWidget):
         painter.drawEllipse(QPointF(0, 0), sa, sa)
         painter.restore()
 
-    def _paint_info(self, painter: QPainter, w: int, h: int):
-        """Info overlay — bottom-right title block."""
-        bw, bh = 200, 60
-        x0, y0 = w - bw - 10, h - bh - 10
+    def _paint_control_panel(self, painter: QPainter, w: int, h: int):
+        """Control panel overlay — bottom-left: node count, connection mode, FPS."""
+        bw, bh = 185, 100
+        x0, y0 = 10, h - bh - 10
 
+        # Semi-transparent background
         painter.setPen(Qt.NoPen)
-        bg = QColor(Colors.BG_RAISED); bg.setAlpha(190)
+        bg = QColor(Colors.BG_RAISED); bg.setAlpha(210)
         painter.setBrush(QBrush(bg))
-        painter.drawRoundedRect(x0, y0, bw, bh, 6, 6)
+        painter.drawRoundedRect(x0, y0, bw, bh, 8, 8)
 
+        # Accent top border
         painter.setPen(QPen(QColor(Colors.ACCENT), 1.5))
-        painter.drawLine(x0, y0, x0 + bw, y0)
+        painter.drawLine(x0 + 4, y0, x0 + bw - 4, y0)
 
-        painter.setFont(QFont("monospace", 7))
-        painter.setPen(QPen(QColor(Colors.TEXT_DIM)))
+        painter.setFont(QFont("monospace", 7, QFont.Bold))
+        painter.setPen(QPen(QColor(Colors.ACCENT)))
+        painter.drawText(x0 + 8, y0 + 15, "CONTROL PANEL")
+
+        painter.setFont(QFont("monospace", 8))
+        painter.setPen(QPen(QColor(Colors.TEXT)))
+
         n_splats = len(self._splats)
         n_conns = len(self._connections)
-        painter.drawText(x0 + 6, y0 + 15, "GAUSSIAN SPLAT EXPLORER")
-        painter.drawText(x0 + 6, y0 + 28, f"Splats: {n_splats}  Connections: {n_conns}")
-        painter.drawText(x0 + 6, y0 + 41, f"Camera: az={math.degrees(self.camera.azimuth):.0f}° "
-                            f"el={math.degrees(self.camera.elevation):.0f}°")
-        painter.drawText(x0 + 6, y0 + 54, f"Projection: perspective {self.camera.fov:.0f}° FOV")
+        painter.drawText(x0 + 8, y0 + 32, f"Nodes:       {n_splats}")
+        painter.drawText(x0 + 8, y0 + 46, f"Connections: {n_conns}")
+        painter.drawText(x0 + 8, y0 + 60, f"Mode:        {self._conn_mode}")
+
+        # FPS with colour coding
+        fps_val = self._fps
+        if fps_val >= 25:
+            fps_color = QColor(34, 197, 94)   # green
+        elif fps_val >= 15:
+            fps_color = QColor(250, 204, 21)  # yellow
+        else:
+            fps_color = QColor(239, 68, 68)   # red
+        painter.setPen(QPen(fps_color))
+        painter.drawText(x0 + 8, y0 + 74, f"FPS:         {fps_val:.0f}")
+
+        painter.setPen(QPen(QColor(Colors.TEXT_DIM)))
+        painter.drawText(x0 + 8, y0 + 90,
+                         f"az={math.degrees(self.camera.azimuth):.0f}°  "
+                         f"el={math.degrees(self.camera.elevation):.0f}°  "
+                         f"d={self.camera.distance:.0f}")
+
+    def _paint_minimap(self, painter: QPainter, w: int, h: int):
+        """Minimap overlay — bottom-right: top-down XZ view of all nodes.
+
+        Shows every node as a coloured dot, connections as faint lines, and
+        a camera FOV cone / viewport rectangle indicating the current view.
+        """
+        mm_size = 160
+        mm_pad = 10
+        x0 = w - mm_size - mm_pad
+        y0 = h - mm_size - mm_pad
+
+        # Background
+        painter.setPen(Qt.NoPen)
+        bg = QColor(Colors.BG_RAISED); bg.setAlpha(200)
+        painter.setBrush(QBrush(bg))
+        painter.drawRoundedRect(x0, y0, mm_size, mm_size, 8, 8)
+
+        # Label
+        painter.setFont(QFont("monospace", 6, QFont.Bold))
+        painter.setPen(QPen(QColor(Colors.TEXT_DIM)))
+        painter.drawText(x0 + 4, y0 + 10, "MINIMAP")
+
+        if not self._splats or not self._mm_bounds:
+            painter.setPen(QPen(QColor(Colors.TEXT_DIM)))
+            painter.setFont(QFont("monospace", 8))
+            painter.drawText(x0 + 30, y0 + mm_size // 2, "No data")
+            return
+
+        x_min, x_max, z_min, z_max = self._mm_bounds
+        x_range = x_max - x_min
+        z_range = z_max - z_min
+
+        # Drawing area inside the rounded rect (with inner padding)
+        inner = 16  # top padding for label
+        pad = 6
+        dx0 = x0 + pad
+        dy0 = y0 + inner
+        dw = mm_size - 2 * pad
+        dh = mm_size - inner - pad
+
+        scale_x = dw / max(x_range, 0.01)
+        scale_z = dh / max(z_range, 0.01)
+        scale = min(scale_x, scale_z)
+
+        # Centre the map within the available area
+        used_w = x_range * scale
+        used_h = z_range * scale
+        off_x = dx0 + (dw - used_w) / 2
+        off_y = dy0 + (dh - used_h) / 2
+
+        def to_mm(wx, wz):
+            mx = off_x + (wx - x_min) * scale
+            my = off_y + (wz - z_min) * scale   # Z grows downward on screen
+            return mx, my
+
+        # Draw connections as faint lines
+        painter.setPen(QPen(QColor(255, 255, 255, 18), 0.5))
+        for i, j, _ in self._connections:
+            if i < len(self._splats) and j < len(self._splats):
+                si, sj = self._splats[i], self._splats[j]
+                x1, y1 = to_mm(si.position[0], si.position[2])
+                x2, y2 = to_mm(sj.position[0], sj.position[2])
+                painter.drawLine(QPointF(x1, y1), QPointF(x2, y2))
+
+        # Draw nodes as small coloured dots
+        painter.setPen(Qt.NoPen)
+        for s in self._splats:
+            mx, my = to_mm(s.position[0], s.position[2])
+            c = QColor(s.color)
+            is_active = s.idx == self._hovered or s.idx == self._selected
+            if is_active:
+                c.setAlpha(255)
+                painter.setBrush(QBrush(c))
+                painter.drawEllipse(QPointF(mx, my), 3.5, 3.5)
+                # Bright glow ring around active node
+                gc = QColor(c); gc.setAlpha(120)
+                painter.setBrush(QBrush(gc))
+                painter.drawEllipse(QPointF(mx, my), 6, 6)
+                painter.setBrush(QBrush(c))
+            else:
+                c.setAlpha(180)
+                painter.setBrush(QBrush(c))
+                painter.drawEllipse(QPointF(mx, my), 2, 2)
+
+        # Camera position in world XZ
+        az = self.camera.azimuth
+        el = self.camera.elevation
+        d = self.camera.distance
+        ca, sa = math.cos(az), math.sin(az)
+        ce, se = math.cos(el), math.sin(el)
+
+        cam_wx = -sa * ce * d
+        cam_wz = ca * ce * d
+
+        cam_mx, cam_my = to_mm(cam_wx, cam_wz)
+
+        # View direction in world XZ (toward the look-at center)
+        # Camera looks toward the scene centre (origin before pan)
+        look_dir_x = -cam_wx
+        look_dir_z = -cam_wz
+        ld_len = math.sqrt(look_dir_x ** 2 + look_dir_z ** 2 + 0.001)
+        look_dir_x /= ld_len
+        look_dir_z /= ld_len
+
+        # FOV half-angle in the XZ plane (approximate)
+        fov_half = math.radians(self.camera.fov / 2) * ce  # projected onto XZ
+
+        # Draw FOV cone
+        cone_len = 25  # pixels on minimap
+        # Two side directions
+        perp_x = -look_dir_z
+        perp_z = look_dir_x
+
+        side_x = math.sin(fov_half)
+        side_z = math.cos(fov_half)
+
+        dir1_x = look_dir_x * side_z + perp_x * side_x
+        dir1_z = look_dir_z * side_z + perp_z * side_x
+        dir2_x = look_dir_x * side_z - perp_x * side_x
+        dir2_z = look_dir_z * side_z - perp_z * side_x
+
+        cone_p1 = QPointF(cam_mx + dir1_x * cone_len, cam_my + dir1_z * cone_len)
+        cone_p2 = QPointF(cam_mx + dir2_x * cone_len, cam_my + dir2_z * cone_len)
+        cone_tip = QPointF(cam_mx, cam_my)
+
+        # Filled cone (very faint)
+        cone_poly = QPolygonF([cone_tip, cone_p1, cone_p2])
+        painter.setPen(Qt.NoPen)
+        cc = QColor(Colors.ACCENT); cc.setAlpha(30)
+        painter.setBrush(QBrush(cc))
+        painter.drawPolygon(cone_poly)
+
+        # Cone outline
+        painter.setPen(QPen(QColor(Colors.ACCENT), 1.0))
+        painter.setBrush(Qt.NoBrush)
+        painter.drawLine(cone_tip, cone_p1)
+        painter.drawLine(cone_tip, cone_p2)
+
+        # Camera dot
+        painter.setPen(Qt.NoPen)
+        painter.setBrush(QBrush(QColor(Colors.ACCENT)))
+        painter.drawEllipse(QPointF(cam_mx, cam_my), 3, 3)
+
+        # Border
+        painter.setPen(QPen(QColor(Colors.ACCENT), 1.0))
+        painter.setBrush(Qt.NoBrush)
+        painter.drawRoundedRect(x0, y0, mm_size, mm_size, 8, 8)
 
     # --- Mouse interaction ---
 
@@ -705,17 +1192,25 @@ class Splat3DCanvas(QWidget):
         if self._drag_start and not (event.modifiers() & Qt.ShiftModifier):
             dx = pos.x() - self._drag_start[0]
             dy = pos.y() - self._drag_start[1]
-            self.camera.azimuth += dx * 0.005
-            self.camera.elevation += dy * 0.005
+            delta_az = dx * 0.005
+            delta_el = dy * 0.005
+            self.camera.azimuth += delta_az
+            self.camera.elevation += delta_el
             self.camera.elevation = max(-math.pi / 2 + 0.1, min(math.pi / 2 - 0.1, self.camera.elevation))
+            self._last_drag_dx = delta_az
+            self._last_drag_dy = delta_el
             self._drag_start = (pos.x(), pos.y())
             self.update()
         elif self._pan_start and (event.modifiers() & Qt.ShiftModifier):
             dx = pos.x() - self._pan_start[0]
             dy = pos.y() - self._pan_start[1]
             scale = 35 / max(self.width(), self.height())
-            self.camera.pan_x += dx * scale
-            self.camera.pan_y -= dy * scale
+            pan_dx = dx * scale
+            pan_dy = dy * scale
+            self.camera.pan_x += pan_dx
+            self.camera.pan_y -= pan_dy
+            self._last_pan_dx = pan_dx
+            self._last_pan_dy = -pan_dy
             self._pan_start = (pos.x(), pos.y())
             self.update()
         else:
@@ -723,6 +1218,15 @@ class Splat3DCanvas(QWidget):
 
     def mouseReleaseEvent(self, event):
         if event.button() == Qt.LeftButton:
+            # Transfer last drag/pan delta to inertia
+            self._inertia_az = self._last_drag_dx
+            self._inertia_el = self._last_drag_dy
+            self._inertia_pan_x = self._last_pan_dx
+            self._inertia_pan_y = self._last_pan_dy
+            self._last_drag_dx = 0.0
+            self._last_drag_dy = 0.0
+            self._last_pan_dx = 0.0
+            self._last_pan_dy = 0.0
             self._drag_start = None
             self._pan_start = None
 

@@ -218,6 +218,36 @@ class SplatsDBClient:
         except (httpx.HTTPStatusError, httpx.ConnectError):
             return {}
 
+    # ── Collections ──────────────────────────────────────────────────
+
+    def list_collections(self) -> list[dict]:
+        """List all collections with metadata."""
+        r = self.client.get("/collections")
+        r.raise_for_status()
+        return r.json().get("collections", [])
+
+    def create_collection(self, name: str, dimension: int = 640,
+                          distance: str = "cosine", metadata: dict | None = None) -> dict:
+        """Create a new collection."""
+        payload = {"name": name, "dimension": dimension, "distance": distance}
+        if metadata:
+            payload["metadata"] = metadata
+        r = self.client.post("/collections", json=payload)
+        r.raise_for_status()
+        return r.json()
+
+    def delete_collection(self, name: str) -> bool:
+        """Delete a collection by name."""
+        r = self.client.delete(f"/collections/{name}")
+        r.raise_for_status()
+        return True
+
+    def collection_info(self, name: str) -> dict:
+        """Get detailed info about a single collection."""
+        r = self.client.get(f"/collections/{name}")
+        r.raise_for_status()
+        return r.json()
+
     # ── Prefetch suggestions ───────────────────────────────────────
 
     def prefetch_suggestions(self, n: int = 10) -> list[str]:

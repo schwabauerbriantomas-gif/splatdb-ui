@@ -7,6 +7,7 @@ Splitter layout: Inspector (left) | File Preview (right).
 
 from __future__ import annotations
 
+from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
@@ -14,11 +15,12 @@ from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
     QScrollArea, QFrame, QSplitter, QTextEdit, QTreeWidget,
     QTreeWidgetItem, QHeaderView, QTableWidget, QTableWidgetItem,
-    QSizePolicy,
+    QSizePolicy, QApplication,
 )
-from PySide6.QtCore import Signal, Qt
-from PySide6.QtGui import QFont
+from PySide6.QtCore import Signal, Qt, QPropertyAnimation, QEasingCurve
+from PySide6.QtGui import QFont, QPainter, QColor, QLinearGradient
 
+from splatsdb_ui.utils.widgets import clearLayout
 from splatsdb_ui.utils.theme import Colors
 from splatsdb_ui.utils.icons import icon
 
@@ -72,11 +74,35 @@ class NodeInspector(QWidget):
 
         # --- ID Section ---
         self.id_section = self._section("Identity")
+
+        # Color swatch + ID row
+        id_row = QHBoxLayout()
+        self._color_swatch = QLabel()
+        self._color_swatch.setFixedSize(20, 20)
+        self._color_swatch.setStyleSheet(
+            f"background: {Colors.BORDER}; border-radius: 10px; border: 2px solid {Colors.BORDER};"
+        )
+        id_row.addWidget(self._color_swatch)
+
         self.id_label = QLabel("No node selected")
         self.id_label.setWordWrap(True)
         self.id_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
         self.id_label.setStyleSheet(f"color: {Colors.TEXT}; font-size: 12px; font-family: monospace;")
-        self.id_section.layout().addWidget(self.id_label)
+        id_row.addWidget(self.id_label, stretch=1)
+
+        self._copy_id_btn = QPushButton()
+        self._copy_id_btn.setIcon(icon("copy", Colors.TEXT))
+        self._copy_id_btn.setFixedSize(28, 28)
+        self._copy_id_btn.setToolTip("Copy node ID")
+        self._copy_id_btn.setStyleSheet(
+            f"QPushButton {{ background: transparent; border: 1px solid {Colors.BORDER}; "
+            f"border-radius: 4px; }}"
+            f"QPushButton:hover {{ border-color: {Colors.ACCENT}; }}"
+        )
+        self._copy_id_btn.clicked.connect(self._copy_id)
+        id_row.addWidget(self._copy_id_btn)
+
+        self.id_section.layout().addLayout(id_row)
         self.content_layout.addWidget(self.id_section)
 
         # --- Metadata Section ---
@@ -90,6 +116,7 @@ class NodeInspector(QWidget):
         self.meta_table.setSelectionBehavior(QTableWidget.SelectRows)
         self.meta_table.setMaximumHeight(200)
         self.meta_table.verticalHeader().setVisible(False)
+        self.meta_table.verticalHeader().setDefaultSectionSize(28)
         self.meta_section.layout().addWidget(self.meta_table)
         self.content_layout.addWidget(self.meta_section)
 
@@ -113,10 +140,26 @@ class NodeInspector(QWidget):
             }}
         """)
         self.vector_section.layout().addWidget(self.vector_display)
+
+        # Mini embedding bar chart (first 16 dims)
+        self._embedding_bars = _EmbeddingBars()
+        self._embedding_bars.setFixedHeight(48)
+        self._embedding_bars.setStyleSheet("background: transparent;")
+        self.vector_section.layout().addWidget(self._embedding_bars)
+
         self.content_layout.addWidget(self.vector_section)
 
         # --- Connections Section ---
         self.conn_section = self._section("Connections")
+
+        # Connected-node chips row
+        self._chips_row = QHBoxLayout()
+        self._chips_row.setSpacing(4)
+        self._chips_row.setContentsMargins(0, 0, 0, 4)
+        self._chips_container = QWidget()
+        self._chips_container.setLayout(self._chips_row)
+        self._chips_container.setStyleSheet("background: transparent;")
+        self.conn_section.layout().addWidget(self._chips_container)
         self.conn_table = QTableWidget()
         self.conn_table.setColumnCount(4)
         self.conn_table.setHorizontalHeaderLabels(["Target", "Score", "Distance", ""])
@@ -163,7 +206,7 @@ class NodeInspector(QWidget):
         self.setStyleSheet(f"background-color: {Colors.BG_RAISED};")
 
     def _section(self, title: str) -> QFrame:
-        """Create a collapsible section frame."""
+        """Create a styled section frame with title header."""
         frame = QFrame()
         frame.setStyleSheet(f"""
             QFrame {{
@@ -191,6 +234,15 @@ class NodeInspector(QWidget):
         """Load full node data into the inspector."""
         self._current_node = node
         node_id = node.get("id", "unknown")
+
+        # Color swatch from node color or hash
+        color = node.get("color", None)
+        if not color:
+            hue = hash(node_id) % 360
+            color = QColor.fromHsv(hue, 180, 220).name()
+        self._color_swatch.setStyleSheet(
+            f"background: {color}; border-radius: 10px; border: 2px solid {Colors.BORDER};"
+        )
 
         # Identity
         meta = node.get("metadata", {})
@@ -222,25 +274,54 @@ class NodeInspector(QWidget):
         else:
             self.vector_display.setText("—")
 
+        # Mini embedding bars
+        self._embedding_bars.set_vector(vector[:16] if vector else [])
+
         # Connections
         connections = node.get("connections", [])
+
+        # Build clickable chips
+        # Clear old chips
+        clearLayout(self._chips_row)
+
+        for conn in connections[:8]:  # Show max 8 chips
+            tid = conn.get("id", "?")
+            score = conn.get("score", 0)
+            chip = QPushButton(tid[:8])
+            chip.setFixedHeight(24)
+            chip.setCursor(Qt.PointingHandCursor)
+            chip.setStyleSheet(
+                f"QPushButton {{ background: {Colors.ACCENT_DARK}; color: {Colors.ACCENT}; "
+                f"border: 1px solid {Colors.ACCENT}; border-radius: 12px; "
+                f"padding: 0 8px; font-size: 10px; font-family: monospace; }}"
+                f"QPushButton:hover {{ background: {Colors.ACCENT}; color: {Colors.BG}; }}"
+            )
+            chip.clicked.connect(lambda checked=False, t=tid: self.navigate_to_node.emit(t))
+            self._chips_row.addWidget(chip)
+
+        if len(connections) > 8:
+            more = QLabel(f"+{len(connections) - 8} more")
+            more.setStyleSheet(f"color: {Colors.TEXT_DIM}; font-size: 10px;")
+            self._chips_row.addWidget(more)
+        self._chips_row.addStretch()
         self.conn_table.setRowCount(0)
         for conn in connections:
             row = self.conn_table.rowCount()
             self.conn_table.insertRow(row)
 
             target_id = conn.get("id", "?")
-            target_item = QTableWidgetItem(target_id[:16])
+            target_item = QTableWidgetItem(target_id)
+            target_item.setToolTip(target_id)
             self.conn_table.setItem(row, 0, target_item)
 
             score = conn.get("score", 0)
             score_item = QTableWidgetItem(f"{score:.4f}")
             if score > 0.8:
-                score_item.setForeground(Qt.green)
+                score_item.setForeground(QColor(Colors.SUCCESS))
             elif score > 0.5:
-                score_item.setForeground(Qt.yellow)
+                score_item.setForeground(QColor(Colors.WARNING))
             else:
-                score_item.setForeground(Qt.red)
+                score_item.setForeground(QColor(Colors.ERROR))
             self.conn_table.setItem(row, 1, score_item)
 
             dist = conn.get("distance", "")
@@ -269,7 +350,6 @@ class NodeInspector(QWidget):
             if p.exists():
                 sz = p.stat().st_size
                 size = f"{sz / 1024:.1f}KB" if sz < 1024 * 1024 else f"{sz / (1024 * 1024):.1f}MB"
-                from datetime import datetime
                 mtime = datetime.fromtimestamp(p.stat().st_mtime).strftime("%Y-%m-%d %H:%M")
             else:
                 mtime = "not found"
@@ -292,6 +372,18 @@ class NodeInspector(QWidget):
             if fpath:
                 self.open_file_requested.emit(fpath)
 
+    def _copy_id(self):
+        if self._current_node:
+            node_id = self._current_node.get("id", "")
+            clipboard = QApplication.clipboard()
+            clipboard.setText(node_id)
+            self._copy_id_btn.setIcon(icon("check", Colors.SUCCESS))
+            from PySide6.QtCore import QTimer
+            QTimer.singleShot(1500, self._reset_copy_btn)
+
+    def _reset_copy_btn(self):
+        self._copy_id_btn.setIcon(icon("copy", Colors.TEXT))
+
     def clear(self):
         self.id_label.setText("No node selected")
         self.meta_table.setRowCount(0)
@@ -305,3 +397,60 @@ class NodeInspector(QWidget):
 def np_norm(v: list) -> float:
     """Compute L2 norm without numpy dependency."""
     return sum(x * x for x in v) ** 0.5 if v else 0.0
+
+
+class _EmbeddingBars(QWidget):
+    """Mini bar chart showing first N embedding dimensions."""
+
+    def __init__(self):
+        super().__init__()
+        self._values: list[float] = []
+
+    def set_vector(self, values: list[float]):
+        self._values = values
+        self.update()
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self.update()
+
+    def paintEvent(self, event):
+        if not self._values:
+            return
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing)
+
+        w, h = self.width(), self.height()
+        n = len(self._values)
+        bar_w = max(2, (w - 4) / n - 1)
+        gap = 1
+
+        max_abs = max(abs(v) for v in self._values) or 1.0
+        mid_y = h / 2
+
+        for i, v in enumerate(self._values):
+            x = 2 + i * (bar_w + gap)
+            norm_v = v / max_abs  # -1 to 1
+
+            # Color: positive = amber, negative = blue
+            if norm_v >= 0:
+                bar_h = norm_v * (mid_y - 2)
+                grad = QLinearGradient(x, mid_y - bar_h, x, mid_y)
+                grad.setColorAt(0, QColor(245, 158, 11, 200))
+                grad.setColorAt(1, QColor(245, 158, 11, 80))
+                painter.setBrush(grad)
+                painter.setPen(Qt.NoPen)
+                painter.drawRoundedRect(int(x), int(mid_y - bar_h), int(bar_w), int(max(bar_h, 1)), 1, 1)
+            else:
+                bar_h = abs(norm_v) * (mid_y - 2)
+                grad = QLinearGradient(x, mid_y, x, mid_y + bar_h)
+                grad.setColorAt(0, QColor(96, 165, 250, 80))
+                grad.setColorAt(1, QColor(96, 165, 250, 200))
+                painter.setBrush(grad)
+                painter.setPen(Qt.NoPen)
+                painter.drawRoundedRect(int(x), int(mid_y), int(bar_w), int(max(bar_h, 1)), 1, 1)
+
+        # Midline
+        painter.setPen(QColor(255, 255, 255, 30))
+        painter.drawLine(0, int(mid_y), w, int(mid_y))
+        painter.end()

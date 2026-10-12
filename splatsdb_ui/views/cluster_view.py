@@ -22,23 +22,25 @@ Renders as a topographic map: filled density bands + crisp contour lines
 from __future__ import annotations
 
 import colorsys
+import os
+import time
 import numpy as np
 from typing import Optional
 from collections import defaultdict
 
 from PySide6.QtWidgets import (
-    QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
+    QWidget, QVBoxLayout, QHBoxLayout, QLabel,
     QComboBox, QSlider, QSplitter, QTreeWidget, QTreeWidgetItem,
     QHeaderView, QSizePolicy, QFrame,
 )
-from PySide6.QtCore import Signal, Qt
+from PySide6.QtCore import Signal, Qt, QTimer, QPointF, QRectF
 from PySide6.QtGui import (
     QPainter, QColor, QPen, QBrush, QFont,
-    QPainterPath, QImage, QLinearGradient,
+    QPainterPath, QImage, QLinearGradient, QPixmap, QTransform,
 )
 
 from splatsdb_ui.utils.theme import Colors
-from splatsdb_ui.utils.icons import icon
+from splatsdb_ui.utils.widgets import build_toolbar
 
 # ---------------------------------------------------------------------------
 # Perceptual palette — same golden-ratio hue spacing as Splat3D
@@ -58,9 +60,18 @@ _COLORS = [
 
 PHI = (1 + np.sqrt(5)) / 2  # Golden ratio ≈ 1.618
 
+# Global palette hue rotation offset (smooth color palette rotation)
+_palette_offset: float = 0.0
+
 
 def _cluster_qcolor(k: int) -> QColor:
-    return QColor(*_COLORS[k % len(_COLORS)])
+    """Get cluster color with optional palette rotation offset."""
+    base = QColor(*_COLORS[k % len(_COLORS)])
+    if _palette_offset != 0.0:
+        h, s, v, a = base.getHsvF()
+        h = (h + _palette_offset) % 1.0
+        base.setHsvF(h, s, v, a)
+    return base
 
 
 # ---------------------------------------------------------------------------
@@ -109,12 +120,11 @@ def compute_kde(
         h = 1.06 * std * max(n_k, 1) ** (-0.2) if std > 0 else 1.0
         h = max(h, rx * 0.05)  # floor to avoid too-tight kernels
 
-        for pt in pts:
-            dx = xx - pt[0]
-            dy = yy - pt[1]
-            r2 = (dx ** 2 + dy ** 2) / (h ** 2)
-            densities[k] += np.exp(-0.5 * r2)
-        densities[k] /= n_k
+        # Vectorized: broadcast (n_k, 1, 1) against (1, grid_res, grid_res)
+        dx = xx[np.newaxis, :, :] - pts[:, 0, np.newaxis, np.newaxis]   # (n_k, H, W)
+        dy = yy[np.newaxis, :, :] - pts[:, 1, np.newaxis, np.newaxis]
+        r2 = (dx ** 2 + dy ** 2) / (h ** 2)
+        densities[k] = np.exp(-0.5 * r2).sum(axis=0) / n_k
 
     return xx, yy, densities, (x_min, x_max, y_min, y_max)
 
@@ -249,10 +259,16 @@ class ClusterCanvas(QWidget):
 
         # Cached computation
         self._density_image: Optional[QImage] = None
-        self._contour_paths: list = []  # [(color, width, path), ...]
+        self._contour_paths: list = []  # [(color, level, path), ...]
         self._voronoi_edge_pts: list = []
         self._extents: tuple = (0, 1, 0, 1)
         self._grid_res: int = 150
+
+        # Screen-space caches (rebuilt only on resize or data change)
+        self._cached_size: tuple = (0, 0)
+        self._cached_scaled_density: Optional[QImage] = None
+        self._cached_voronoi_path: Optional[QPainterPath] = None
+        self._cached_screen_contours: list = []  # [(color, level, screen_path), ...]
 
         self._hovered_cluster: int = -1
         self._selected_cluster: int = -1
@@ -262,6 +278,63 @@ class ClusterCanvas(QWidget):
         self.show_sigma = True
         self.show_points = True
         self.show_density = True
+
+        # Density scale for colorbar
+        self._density_max: float = 1.0
+
+        # Fade transition state
+        self._prev_density_image: Optional[QImage] = None
+        self._cached_prev_scaled_density: Optional[QImage] = None
+        self._fade_opacity: float = 1.0
+        self._fade_steps: int = 0
+        self._fade_total_steps: int = 25  # ~400ms at 60fps
+        self._fade_timer = QTimer(self)
+        self._fade_timer.setInterval(16)  # ~60fps
+        self._fade_timer.timeout.connect(self._on_fade_tick)
+
+        # Hover label position (screen coords)
+        self._hover_pos = None
+
+        # Zoom/pan state with smooth animation
+        self._zoom_level: float = 1.0
+        self._target_zoom: float = 1.0
+        self._pan_x: float = 0.0
+        self._pan_y: float = 0.0
+        self._target_pan_x: float = 0.0
+        self._target_pan_y: float = 0.0
+        self._is_panning: bool = False
+        self._pan_start = QPointF()
+        self._pan_start_offset = (0.0, 0.0)
+        self._zoom_pan_timer = QTimer(self)
+        self._zoom_pan_timer.setInterval(16)
+        self._zoom_pan_timer.timeout.connect(self._animate_zoom_pan)
+
+        # Static pixmap cache for density/voronoi/contours
+        self._static_pixmap: Optional[QPixmap] = None
+        self._static_pixmap_dirty: bool = True
+
+        # FPS counter (debug mode)
+        self._debug_mode: bool = os.environ.get("SPLATSDB_DEBUG", "").strip() == "1"
+        self._fps: float = 0.0
+        self._frame_count: int = 0
+        self._fps_time: float = time.time()
+        self._fps_timer = QTimer(self)
+        self._fps_timer.setInterval(1000)
+        self._fps_timer.timeout.connect(self._update_fps)
+        if self._debug_mode:
+            self._fps_timer.start()
+
+        # Label animation state (per-cluster opacity)
+        self._label_opacities: dict[int, float] = {}
+        self._label_anim_timer = QTimer(self)
+        self._label_anim_timer.setInterval(16)
+        self._label_anim_timer.timeout.connect(self._animate_labels)
+
+        # Resize debounce
+        self._resize_timer = QTimer(self)
+        self._resize_timer.setSingleShot(True)
+        self._resize_timer.setInterval(50)
+        self._resize_timer.timeout.connect(self._on_resize_debounced)
 
     def set_data(
         self,
@@ -273,6 +346,13 @@ class ClusterCanvas(QWidget):
         self._labels = labels
         self._n_clusters = int(labels.max()) + 1
         self._connections = connections or []
+
+        # Save old density image for fade transition
+        if self._density_image is not None:
+            self._prev_density_image = self._density_image
+            self._cached_prev_scaled_density = None
+        else:
+            self._prev_density_image = None
 
         # Centroids and covariances
         self._centroids = np.zeros((self._n_clusters, 2))
@@ -298,21 +378,41 @@ class ClusterCanvas(QWidget):
         assignment = compute_voronoi(self._centroids, self._grid_res, extents)
         self._voronoi_edge_pts = voronoi_edges(assignment)
 
-        self.update()
+        # Start fade transition (replaces direct self.update())
+        self._start_fade_transition()
+
+        # Mark static pixmap cache dirty for density/voronoi/contours
+        self._static_pixmap_dirty = True
+
+        # Start label animations — fade in new cluster labels
+        self._label_opacities = {k: 0.0 for k in range(self._n_clusters)}
+        self._label_anim_timer.start()
+
+        # Reset zoom/pan on new data
+        self._target_zoom = 1.0
+        self._target_pan_x = 0.0
+        self._target_pan_y = 0.0
+        if not self._zoom_pan_timer.isActive():
+            self._zoom_pan_timer.start()
 
     def _build_density_image(self, densities: np.ndarray):
-        """Render KDE density as a QImage with topographic banding."""
+        """Render KDE density as a QImage with topographic banding.
+
+        Uses numpy vectorization instead of per-pixel Python loops
+        for a ~100x speedup over the naive approach.
+        """
         grid_res = self._grid_res
-        img = QImage(grid_res, grid_res, QImage.Format_ARGB32)
 
         # Dominant cluster per pixel + total density
         dominant = np.argmax(densities, axis=0)
         max_density = np.max(densities, axis=0)
 
-        # Global max for normalization
-        d_max = max_density.max()
+        d_max = float(max_density.max())
         if d_max < 1e-10:
             d_max = 1.0
+        self._density_max = d_max
+
+        d_norm = max_density / d_max  # (grid_res, grid_res) normalised
 
         # Topographic contour bands at golden-ratio-spaced levels
         n_bands = 6
@@ -320,43 +420,56 @@ class ClusterCanvas(QWidget):
         level = 1.0
         for _ in range(n_bands):
             band_levels.append(level)
-            level /= PHI  # Golden ratio spacing
+            level /= PHI
 
-        for y in range(grid_res):
-            for x in range(grid_res):
-                k = dominant[y, x]
-                d = max_density[y, x] / d_max
+        # Vectorised band index computation
+        band_idx = np.zeros((grid_res, grid_res), dtype=np.int32)
+        for b, bl in enumerate(band_levels):
+            mask = d_norm >= bl
+            band_idx[mask] = b
 
-                base_color = _cluster_qcolor(k)
+        brightness = 0.15 + 0.12 * band_idx
 
-                # Determine band index
-                band = 0
-                for b, bl in enumerate(band_levels):
-                    if d >= bl:
-                        band = b
-                        break
+        # Colour look-up table from palette
+        n_c = max(self._n_clusters, 1)
+        colors = np.array(
+            [_COLORS[k % len(_COLORS)] for k in range(n_c)],
+            dtype=np.float32,
+        )
 
-                # Brightness: increase with band level (higher density = brighter)
-                brightness = 0.15 + 0.12 * band
-                alpha = int(min(brightness * 255, 180))
+        base_r = colors[dominant, 0]
+        base_g = colors[dominant, 1]
+        base_b = colors[dominant, 2]
 
-                # Mix color with darkness
-                r = int(base_color.red() * brightness)
-                g = int(base_color.green() * brightness)
-                b_val = int(base_color.blue() * brightness)
+        r = base_r * brightness
+        g = base_g * brightness
+        b_val = base_b * brightness
 
-                # Slight band boundary darkening for topographic effect
-                for bl in band_levels:
-                    rel_dist = abs(d - bl) / max(bl, 0.01)
-                    if rel_dist < 0.03:
-                        r = int(r * 0.6)
-                        g = int(g * 0.6)
-                        b_val = int(b_val * 0.6)
-                        break
+        # Band boundary darkening (vectorised)
+        for bl in band_levels:
+            rel_dist = np.abs(d_norm - bl) / max(bl, 0.01)
+            dark = rel_dist < 0.03
+            r[dark] *= 0.6
+            g[dark] *= 0.6
+            b_val[dark] *= 0.6
 
-                img.setPixelColor(x, y, QColor(r, g, b_val, alpha))
+        r = np.clip(r, 0, 255).astype(np.uint32)
+        g = np.clip(g, 0, 255).astype(np.uint32)
+        b_val = np.clip(b_val, 0, 255).astype(np.uint32)
+        alpha = np.clip(brightness * 255, 0, 180).astype(np.uint32)
 
-        self._density_image = img
+        # ARGB32 pixel buffer: 0xAARRGGBB
+        pixels = (alpha << 24) | (r << 16) | (g << 8) | b_val
+        pixels = np.ascontiguousarray(pixels)
+
+        img = QImage(
+            pixels.tobytes(), grid_res, grid_res,
+            grid_res * 4, QImage.Format_ARGB32,
+        )
+        self._density_image = img.copy()
+
+        # Invalidate screen cache since density image changed
+        self._invalidate_screen_cache()
 
     def _extract_all_contours(self, densities: np.ndarray):
         """Extract contour lines for each cluster at golden-ratio levels."""
@@ -397,53 +510,102 @@ class ClusterCanvas(QWidget):
         sy = margin + gy / gr * (h - 2 * margin)
         return sx, sy
 
-    def paintEvent(self, event):
-        if self._positions is None:
-            return
+    # ------------------------------------------------------------------
+    # Screen-space cache management
+    # ------------------------------------------------------------------
 
-        painter = QPainter(self)
-        painter.setRenderHint(QPainter.Antialiasing)
+    def _invalidate_screen_cache(self):
+        """Mark screen-space caches as stale (called on data or size change)."""
+        self._cached_size = (0, 0)
+        self._cached_scaled_density = None
+        self._cached_voronoi_path = None
+        self._cached_screen_contours = []
+        self._cached_prev_scaled_density = None
+        self._static_pixmap_dirty = True
+
+    def _rebuild_screen_caches(self):
+        """Rebuild all screen-space resources from grid-space data.
+
+        Called only when widget size changes or data is invalidated.
+        This avoids per-frame recomputation in paintEvent.
+        """
         w, h = self.width(), self.height()
+        margin = 50
+        draw_w, draw_h = w - 2 * margin, h - 2 * margin
+        self._cached_size = (w, h)
 
-        # Background
-        painter.fillRect(0, 0, w, h, QColor(Colors.BG))
+        # 1. Scaled density image (avoid per-frame QImage.scaled)
+        if self._density_image is not None:
+            self._cached_scaled_density = self._density_image.scaled(
+                draw_w, draw_h,
+            )
 
-        # Subtle graph paper grid
-        painter.setPen(QPen(QColor(255, 255, 255, 8), 0.5))
-        for x in range(0, w, 25):
-            painter.drawLine(x, 0, x, h)
-        for y in range(0, h, 25):
-            painter.drawLine(0, y, w, y)
-
-        # Density heatmap
-        if self.show_density and self._density_image is not None:
-            margin = 50
-            scaled = self._density_image.scaled(w - 2 * margin, h - 2 * margin)
-            painter.drawImage(margin, margin, scaled)
-
-        # Voronoi boundaries
-        if self.show_voronoi and self._voronoi_edge_pts:
-            painter.setPen(QPen(QColor(255, 255, 255, 25), 1.5))
+        # 2. Voronoi edges as single QPainterPath (avoid per-frame drawPoint loop)
+        if self._voronoi_edge_pts:
+            vpath = QPainterPath()
             for gx, gy in self._voronoi_edge_pts:
                 sx, sy = self._grid_to_screen(gx, gy)
-                painter.drawPoint(int(sx), int(sy))
+                si, sj = int(sx), int(sy)
+                vpath.moveTo(si, sj)
+                vpath.lineTo(si + 1, sj)
+            self._cached_voronoi_path = vpath
+        else:
+            self._cached_voronoi_path = None
+
+        # 3. Contour paths pre-transformed to screen space
+        self._cached_screen_contours = []
+        for color, level, path in self._contour_paths:
+            screen_path = QPainterPath()
+            count = path.elementCount()
+            for i in range(count):
+                el = path.elementAt(i)
+                sx, sy = self._grid_to_screen(el.x, el.y)
+                if i == 0 or el.type == 0:  # MoveTo
+                    screen_path.moveTo(sx, sy)
+                else:
+                    screen_path.lineTo(sx, sy)
+            self._cached_screen_contours.append((color, level, screen_path))
+
+    def _build_static_pixmap(self):
+        """Render density, voronoi, and contours into a cached QPixmap.
+
+        These are the most expensive static layers — caching avoids
+        per-frame recomputation when only dynamic elements (hover, labels)
+        change.
+        """
+        w, h = self.width(), self.height()
+        margin = 50
+        draw_w, draw_h = w - 2 * margin, h - 2 * margin
+
+        pm = QPixmap(w, h)
+        pm.fill(Qt.GlobalColor.transparent)
+        painter = QPainter(pm)
+        painter.setRenderHint(QPainter.Antialiasing)
+
+        # Density heatmap with fade transition
+        if self.show_density:
+            if self._fade_opacity < 1.0 and self._prev_density_image is not None:
+                if self._cached_prev_scaled_density is None:
+                    self._cached_prev_scaled_density = self._prev_density_image.scaled(
+                        draw_w, draw_h,
+                    )
+                painter.setOpacity(1.0 - self._fade_opacity)
+                painter.drawImage(margin, margin, self._cached_prev_scaled_density)
+                painter.setOpacity(self._fade_opacity)
+                if self._cached_scaled_density is not None:
+                    painter.drawImage(margin, margin, self._cached_scaled_density)
+            elif self._cached_scaled_density is not None:
+                painter.drawImage(margin, margin, self._cached_scaled_density)
+
+        # Voronoi boundaries
+        if self.show_voronoi and self._cached_voronoi_path is not None:
+            painter.setPen(QPen(Colors.with_alpha(QColor(Colors.TEXT), 25), 1.5))
+            painter.setBrush(Qt.NoBrush)
+            painter.drawPath(self._cached_voronoi_path)
 
         # Contour lines
         if self.show_contours:
-            gr = self._grid_res
-            for color, level, path in self._contour_paths:
-                # Scale path from grid coords to screen coords
-                screen_path = QPainterPath()
-                # Recreate path with screen coords
-                count = path.elementCount()
-                for i in range(count):
-                    el = path.elementAt(i)
-                    sx, sy = self._grid_to_screen(el.x, el.y)
-                    if i == 0 or el.type == 0:  # MoveTo
-                        screen_path.moveTo(sx, sy)
-                    else:
-                        screen_path.lineTo(sx, sy)
-
+            for color, level, screen_path in self._cached_screen_contours:
                 alpha = int(60 + level * 200)
                 pen_color = QColor(color)
                 pen_color.setAlpha(min(alpha, 220))
@@ -452,18 +614,60 @@ class ClusterCanvas(QWidget):
                 painter.setBrush(Qt.NoBrush)
                 painter.drawPath(screen_path)
 
+        painter.end()
+        self._static_pixmap = pm
+        self._static_pixmap_dirty = False
+
+    def paintEvent(self, event):
+        if self._positions is None:
+            return
+
+        t0 = time.time()
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing)
+        w, h = self.width(), self.height()
+
+        # Rebuild screen-space caches only when size changes
+        if (w, h) != self._cached_size:
+            self._rebuild_screen_caches()
+
+        # Background
+        painter.fillRect(0, 0, w, h, QColor(Colors.BG))
+
+        # Subtle graph paper grid
+        pen_grid = QPen(Colors.with_alpha(QColor(Colors.TEXT), 8), 0.5)
+        painter.setPen(pen_grid)
+        for x in range(0, w, 25):
+            painter.drawLine(x, 0, x, h)
+        for y in range(0, h, 25):
+            painter.drawLine(0, y, w, y)
+
+        # Apply zoom/pan transform for data layers
+        painter.save()
+        cx, cy = w / 2.0, h / 2.0
+        transform = QTransform()
+        transform.translate(cx + self._pan_x, cy + self._pan_y)
+        transform.scale(self._zoom_level, self._zoom_level)
+        transform.translate(-cx, -cy)
+        painter.setTransform(transform)
+
+        # Static layers: density + voronoi + contours (cached pixmap)
+        if self._static_pixmap_dirty or self._static_pixmap is None:
+            self._build_static_pixmap()
+        if self._static_pixmap is not None:
+            painter.drawPixmap(0, 0, self._static_pixmap)
+
         # Sigma ellipses
         if self.show_sigma and self._centroids is not None:
             for k in range(self._n_clusters):
-                cx, cy = self._to_screen(self._centroids[k, 0], self._centroids[k, 1])
+                cx_k, cy_k = self._to_screen(self._centroids[k, 0], self._centroids[k, 1])
                 cov = self._covariances[k]
                 color = _cluster_qcolor(k)
 
-                # Eigenvalues → sigma radii, eigenvectors → rotation
                 try:
                     eigvals, eigvecs = np.linalg.eigh(cov)
                     eigvals = np.maximum(eigvals, 0.001)
-                except:
+                except Exception:
                     eigvals = np.array([0.1, 0.1])
                     eigvecs = np.eye(2)
 
@@ -474,7 +678,8 @@ class ClusterCanvas(QWidget):
                 px_y = (h - 100) / full_range_y
 
                 for sigma_mult, line_style, alpha_base in [
-                    (3, Qt.DotLine, 25), (2, Qt.DashLine, 45), (1, Qt.SolidLine, 80)
+                    (3, Qt.PenStyle.DotLine, 25), (2, Qt.PenStyle.DashLine, 45),
+                    (1, Qt.PenStyle.SolidLine, 80)
                 ]:
                     rx = np.sqrt(eigvals[0]) * sigma_mult * px_x
                     ry = np.sqrt(eigvals[1]) * sigma_mult * px_y
@@ -485,10 +690,53 @@ class ClusterCanvas(QWidget):
                     painter.setBrush(Qt.NoBrush)
 
                     painter.save()
-                    painter.translate(cx, cy)
+                    painter.translate(cx_k, cy_k)
                     painter.rotate(-angle)
                     painter.drawEllipse(int(-rx), int(-ry), int(2 * rx), int(2 * ry))
                     painter.restore()
+
+        # Cluster boundary highlighting on hover
+        if self._hovered_cluster >= 0 and self._centroids is not None:
+            k = self._hovered_cluster
+            cx_k, cy_k = self._to_screen(self._centroids[k, 0], self._centroids[k, 1])
+            color = _cluster_qcolor(k)
+            cov = self._covariances[k] if k < len(self._covariances) else np.eye(2) * 0.01
+            try:
+                eigvals, eigvecs = np.linalg.eigh(cov)
+                eigvals = np.maximum(eigvals, 0.001)
+            except Exception:
+                eigvals = np.array([0.1, 0.1])
+                eigvecs = np.eye(2)
+            angle = np.degrees(np.arctan2(eigvecs[1, 0], eigvecs[0, 0]))
+            full_range_x = max(self._extents[1] - self._extents[0], 0.01)
+            full_range_y = max(self._extents[3] - self._extents[2], 0.01)
+            px_x = (w - 100) / full_range_x
+            px_y = (h - 100) / full_range_y
+            rx = np.sqrt(eigvals[0]) * 2.5 * px_x
+            ry = np.sqrt(eigvals[1]) * 2.5 * px_y
+            glow = QColor(color)
+            glow.setAlpha(30)
+            painter.setPen(QPen(QColor(color), 2, Qt.PenStyle.DashDotLine))
+            painter.setBrush(QBrush(glow))
+            painter.save()
+            painter.translate(cx_k, cy_k)
+            painter.rotate(-angle)
+            painter.drawEllipse(int(-rx), int(-ry), int(2 * rx), int(2 * ry))
+            painter.restore()
+
+        # Point shadows for depth (render behind points)
+        if self.show_points:
+            pen_shadow = QPen(Qt.PenStyle.NoPen)
+            shadow_color = QColor(0, 0, 0, 40)
+            painter.setPen(pen_shadow)
+            painter.setBrush(QBrush(shadow_color))
+            for i in range(len(self._positions)):
+                k = self._labels[i]
+                sx, sy = self._to_screen(self._positions[i, 0], self._positions[i, 1])
+                if k == self._hovered_cluster or k == self._selected_cluster:
+                    painter.drawEllipse(int(sx - 5 + 1), int(sy - 5 + 1), 10, 10)
+                else:
+                    painter.drawEllipse(int(sx - 3 + 1), int(sy - 3 + 1), 6, 6)
 
         # Points
         if self.show_points:
@@ -498,10 +746,10 @@ class ClusterCanvas(QWidget):
                 color = _cluster_qcolor(k)
 
                 if k == self._hovered_cluster or k == self._selected_cluster:
-                    painter.setPen(QPen(QColor(255, 255, 255, 180), 1))
+                    painter.setPen(QPen(Colors.with_alpha(QColor(Colors.TEXT), 180), 1))
                     size = 5
                 else:
-                    painter.setPen(Qt.NoPen)
+                    painter.setPen(Qt.PenStyle.NoPen)
                     size = 3
 
                 pc = QColor(color)
@@ -509,40 +757,58 @@ class ClusterCanvas(QWidget):
                 painter.setBrush(QBrush(pc))
                 painter.drawEllipse(int(sx - size), int(sy - size), size * 2, size * 2)
 
-        # Centroid markers
+        # Centroid markers with animated labels
         if self._centroids is not None:
             for k in range(self._n_clusters):
-                cx, cy = self._to_screen(self._centroids[k, 0], self._centroids[k, 1])
+                cx_k, cy_k = self._to_screen(self._centroids[k, 0], self._centroids[k, 1])
                 color = _cluster_qcolor(k)
                 mask = self._labels == k
                 n_k = int(mask.sum())
 
-                # Cross marker
-                pen = QPen(QColor(color), 2.5)
-                painter.setPen(pen)
-                painter.drawLine(int(cx - 8), int(cy), int(cx + 8), int(cy))
-                painter.drawLine(int(cx), int(cy - 8), int(cx), int(cy + 8))
+                # Label opacity animation
+                opacity = self._label_opacities.get(k, 1.0)
 
-                # Label with background
+                # Cross marker
+                painter.setPen(QPen(QColor(color), 2.5))
+                painter.drawLine(int(cx_k - 8), int(cy_k), int(cx_k + 8), int(cy_k))
+                painter.drawLine(int(cx_k), int(cy_k - 8), int(cx_k), int(cy_k + 8))
+
+                # Label with background (animated opacity)
+                painter.setOpacity(opacity)
                 label = f"C{k}"
-                painter.setFont(QFont("monospace", 9, QFont.Bold))
+                painter.setFont(QFont("monospace", 9, QFont.Weight.Bold))
                 fm = painter.fontMetrics()
                 tw = fm.horizontalAdvance(label)
                 th = fm.height()
 
                 bg = QColor(Colors.BG)
                 bg.setAlpha(180)
-                painter.fillRect(int(cx + 10), int(cy - th), tw + 6, th + 2, bg)
+                painter.fillRect(int(cx_k + 10), int(cy_k - th), tw + 6, th + 2, bg)
 
                 painter.setPen(QPen(color))
-                painter.drawText(int(cx + 13), int(cy - 2), label)
+                painter.drawText(int(cx_k + 13), int(cy_k - 2), label)
 
                 painter.setFont(QFont("sans-serif", 7))
                 painter.setPen(QPen(QColor(Colors.TEXT_DIM)))
-                painter.drawText(int(cx + 13), int(cy + 10), f"n={n_k}")
+                painter.drawText(int(cx_k + 13), int(cy_k + 10), f"n={n_k}")
+                painter.setOpacity(1.0)
 
         # Inter-cluster arcs
         self._paint_connections(painter)
+
+        # Restore from zoom/pan transform
+        painter.restore()
+
+        # UI overlays (not affected by zoom/pan)
+        self._paint_colorbar(painter)
+        self._paint_legend(painter)
+        self._paint_hover_label(painter)
+
+        if self._debug_mode:
+            self._paint_fps_counter(painter)
+
+        # FPS frame counting
+        self._frame_count += 1
 
         painter.end()
 
@@ -562,12 +828,12 @@ class ClusterCanvas(QWidget):
             my = (p1[1] + p2[1]) / 2 - 30 * (1 - score)
 
             alpha = int(score * 180)
-            # Gradient color based on score
-            r = int(100 + 155 * score)
-            g = int(180 * score)
-            b = int(255 * (1 - score * 0.5))
-            pen = QPen(QColor(r, g, b, alpha), 1.5 + score * 2)
-            painter.setPen(pen)
+            # Use amber-to-blue gradient based on score
+            arc_color = Colors.lerp_color(
+                QColor(Colors.INFO), QColor(Colors.ACCENT), score
+            )
+            arc_color.setAlpha(alpha)
+            painter.setPen(QPen(arc_color, 1.5 + score * 2))
 
             path = QPainterPath()
             path.moveTo(p1[0], p1[1])
@@ -580,10 +846,339 @@ class ClusterCanvas(QWidget):
                 painter.setPen(QPen(QColor(Colors.TEXT_DIM)))
                 painter.drawText(int(mx - 12), int(my - 5), f"{score:.2f}")
 
+    # ------------------------------------------------------------------
+    # Fade transition
+    # ------------------------------------------------------------------
+
+    def _start_fade_transition(self):
+        """Start a crossfade animation from old to new density image."""
+        if self._prev_density_image is not None:
+            self._fade_opacity = 0.0
+            self._fade_steps = 0
+            self._fade_timer.start()
+        else:
+            self._fade_opacity = 1.0
+        self.update()
+
+    def _on_fade_tick(self):
+        """Advance the fade animation by one step (called by timer)."""
+        self._fade_steps += 1
+        # Ease-out quadratic curve for smooth deceleration
+        t = self._fade_steps / self._fade_total_steps
+        self._fade_opacity = 1.0 - (1.0 - t) ** 2
+
+        if self._fade_steps >= self._fade_total_steps:
+            self._fade_timer.stop()
+            self._fade_opacity = 1.0
+            self._prev_density_image = None
+            self._cached_prev_scaled_density = None
+            self._static_pixmap_dirty = True  # Rebuild static cache without fade
+
+        self.update()
+
+    # ------------------------------------------------------------------
+    # Density colorbar
+    # ------------------------------------------------------------------
+
+    def _paint_colorbar(self, painter: QPainter):
+        """Draw a density scale colorbar on the right side of the canvas."""
+        w, h = self.width(), self.height()
+        margin = 50
+
+        bar_w = 14
+        bar_h = h - 2 * margin - 60
+        if bar_h < 60:
+            return
+        bar_x = w - margin + 10
+        bar_y = margin + 30
+
+        # Vertical gradient: bottom=low → top=high, using amber base color
+        gradient = QLinearGradient(bar_x, bar_y + bar_h, bar_x, bar_y)
+        amber = _COLORS[0]  # Amber as representative density color
+        n_steps = 10
+        for i in range(n_steps + 1):
+            t = i / n_steps
+            brightness = 0.15 + 0.60 * t
+            r = int(min(amber[0] * brightness, 255))
+            g = int(min(amber[1] * brightness, 255))
+            b = int(min(amber[2] * brightness, 255))
+            gradient.setColorAt(1.0 - t, QColor(r, g, b, 200))
+
+        # Bar background + border
+        painter.setPen(QPen(Colors.with_alpha(QColor(Colors.TEXT), 35), 1))
+        painter.setBrush(QBrush(gradient))
+        painter.drawRoundedRect(int(bar_x), int(bar_y), bar_w, int(bar_h), 3, 3)
+
+        # Band-level tick marks
+        band_levels = []
+        level = 1.0
+        for _ in range(6):
+            band_levels.append(level)
+            level /= PHI
+
+        painter.setFont(QFont("sans-serif", 7))
+        for bl in band_levels:
+            y_pos = bar_y + bar_h * (1.0 - bl)
+            if y_pos < bar_y or y_pos > bar_y + bar_h:
+                continue
+            # Tick mark
+            painter.setPen(QPen(Colors.with_alpha(QColor(Colors.TEXT), 50), 0.5))
+            painter.drawLine(int(bar_x - 3), int(y_pos), int(bar_x), int(y_pos))
+            # Value label
+            val = self._density_max * bl
+            painter.setPen(QPen(QColor(Colors.TEXT_DIM)))
+            painter.drawText(int(bar_x + bar_w + 3), int(y_pos + 4), f"{val:.2f}")
+
+        # Top/Bottom labels
+        painter.setPen(QPen(QColor(Colors.TEXT)))
+        painter.setFont(QFont("sans-serif", 7, QFont.Weight.Bold))
+        painter.drawText(int(bar_x - 1), int(bar_y - 6), "High")
+        painter.drawText(int(bar_x + 2), int(bar_y + bar_h + 12), "Low")
+
+        # Rotated "Density" title
+        painter.save()
+        painter.translate(int(bar_x - 6), int(bar_y + bar_h / 2))
+        painter.rotate(-90)
+        painter.setFont(QFont("sans-serif", 8, QFont.Weight.Bold))
+        painter.setPen(QPen(QColor(Colors.TEXT_DIM)))
+        painter.drawText(0, 0, "Density")
+        painter.restore()
+
+    # ------------------------------------------------------------------
+    # Hover label overlay
+    # ------------------------------------------------------------------
+
+    def _paint_hover_label(self, painter: QPainter):
+        """Draw a floating info card for the hovered cluster."""
+        if self._hovered_cluster < 0 or self._centroids is None:
+            return
+        if self._hover_pos is None:
+            return
+
+        k = self._hovered_cluster
+        color = _cluster_qcolor(k)
+        mask = self._labels == k
+        n_k = int(mask.sum())
+
+        # Compute spread (σ)
+        spread = 0.0
+        if self._covariances is not None and k < len(self._covariances):
+            spread = float(np.sqrt(np.trace(self._covariances[k]) / 2))
+
+        lines = [
+            f"Cluster C{k}",
+            f"Points: {n_k}",
+            f"Spread (σ): {spread:.3f}",
+        ]
+
+        # Measure text
+        painter.setFont(QFont("sans-serif", 9))
+        fm = painter.fontMetrics()
+        line_h = fm.height()
+        max_w = max(fm.horizontalAdvance(l) for l in lines)
+
+        padding = 8
+        box_w = max_w + 2 * padding + 4  # +4 for accent bar
+        box_h = len(lines) * line_h + 2 * padding
+
+        # Position near centroid, offset to avoid obscuring it
+        cx, cy = self._to_screen(self._centroids[k, 0], self._centroids[k, 1])
+        bx = cx + 22
+        by = cy - box_h // 2
+
+        # Clamp within widget bounds
+        w, h = self.width(), self.height()
+        if bx + box_w > w - 10:
+            bx = cx - box_w - 22
+        if by < 10:
+            by = 10
+        if by + box_h > h - 10:
+            by = h - box_h - 10
+
+        # Background card with rounded corners
+        bg = QColor(Colors.BG_RAISED)
+        bg.setAlpha(230)
+        painter.setPen(QPen(color, 1.5))
+        painter.setBrush(QBrush(bg))
+        painter.drawRoundedRect(int(bx), int(by), int(box_w), int(box_h), 6, 6)
+
+        # Accent color bar on the left edge
+        accent = QColor(color)
+        accent.setAlpha(200)
+        painter.setPen(Qt.NoPen)
+        painter.setBrush(QBrush(accent))
+        painter.drawRoundedRect(int(bx), int(by), 4, int(box_h), 2, 2)
+
+        # Text lines
+        text_x = int(bx + padding + 4)
+        for i, line in enumerate(lines):
+            ty = int(by + padding + (i + 1) * line_h - 3)
+            if i == 0:
+                painter.setFont(QFont("sans-serif", 9, QFont.Weight.Bold))
+                painter.setPen(QPen(color))
+            else:
+                painter.setFont(QFont("sans-serif", 9))
+                painter.setPen(QPen(QColor(Colors.TEXT)))
+            painter.drawText(text_x, ty, line)
+
+        # Highlight ring around hovered centroid
+        painter.setPen(QPen(QColor(color), 2, Qt.PenStyle.DashLine))
+        painter.setBrush(Qt.NoBrush)
+        painter.drawEllipse(int(cx - 14), int(cy - 14), 28, 28)
+
+    # ------------------------------------------------------------------
+    # Color legend with count badges
+    # ------------------------------------------------------------------
+
+    def _paint_legend(self, painter: QPainter):
+        """Draw cluster color legend with count badges in bottom-left."""
+        if self._n_clusters == 0 or self._labels is None:
+            return
+
+        w, h = self.width(), self.height()
+        padding = 8
+        swatch_size = 12
+        row_h = 20
+        badge_w = 32
+        badge_h = 16
+
+        n = self._n_clusters
+        box_w = 120
+        box_h = padding + n * row_h + padding
+
+        lx = 60
+        ly = h - box_h - 10
+
+        # Background card
+        bg = QColor(Colors.BG_RAISED)
+        bg.setAlpha(210)
+        painter.setPen(QPen(QColor(Colors.BORDER), 1))
+        painter.setBrush(QBrush(bg))
+        painter.drawRoundedRect(lx, ly, box_w, box_h, 6, 6)
+
+        for k in range(n):
+            color = _cluster_qcolor(k)
+            ry = ly + padding + k * row_h
+
+            # Color swatch
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(QBrush(color))
+            painter.drawRoundedRect(lx + padding, int(ry), swatch_size, swatch_size, 2, 2)
+
+            # Cluster label
+            painter.setPen(QColor(Colors.TEXT))
+            painter.setFont(QFont("sans-serif", 8))
+            painter.drawText(lx + padding + swatch_size + 5, int(ry + 10), f"C{k}")
+
+            # Count badge
+            n_k = int((self._labels == k).sum())
+            badge_x = lx + box_w - badge_w - 4
+            badge_bg = QColor(color)
+            badge_bg.setAlpha(40)
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(QBrush(badge_bg))
+            painter.drawRoundedRect(badge_x, int(ry), badge_w, badge_h, 3, 3)
+            painter.setPen(QColor(color))
+            painter.setFont(QFont("monospace", 7, QFont.Weight.Bold))
+            painter.drawText(badge_x + 4, int(ry + 11), f"n={n_k}")
+
+    # ------------------------------------------------------------------
+    # FPS counter (debug mode)
+    # ------------------------------------------------------------------
+
+    def _paint_fps_counter(self, painter: QPainter):
+        """Render FPS counter in the top-left corner."""
+        painter.setPen(QColor(Colors.ACCENT))
+        painter.setFont(QFont("monospace", 9))
+        painter.drawText(10, 20, f"FPS: {self._fps:.0f}")
+        painter.setPen(QColor(Colors.TEXT_DIM))
+        painter.drawText(10, 34, f"Zoom: {self._zoom_level:.2f}x")
+
+    def _update_fps(self):
+        """Update FPS calculation every second."""
+        now = time.time()
+        elapsed = now - self._fps_time
+        if elapsed > 0:
+            self._fps = self._frame_count / elapsed
+        self._frame_count = 0
+        self._fps_time = now
+
+    # ------------------------------------------------------------------
+    # Label animation
+    # ------------------------------------------------------------------
+
+    def _animate_labels(self):
+        """Gradually increase label opacity from 0 to 1."""
+        all_done = True
+        for k in self._label_opacities:
+            if self._label_opacities[k] < 1.0:
+                self._label_opacities[k] = min(1.0, self._label_opacities[k] + 0.06)
+                all_done = False
+        if all_done:
+            self._label_anim_timer.stop()
+        self.update()
+
+    # ------------------------------------------------------------------
+    # Zoom/pan smooth animation
+    # ------------------------------------------------------------------
+
+    def _animate_zoom_pan(self):
+        """Smooth interpolation toward target zoom/pan values."""
+        lerp = 0.15
+        dx = self._target_zoom - self._zoom_level
+        dpx = self._target_pan_x - self._pan_x
+        dpy = self._target_pan_y - self._pan_y
+
+        self._zoom_level += dx * lerp
+        self._pan_x += dpx * lerp
+        self._pan_y += dpy * lerp
+
+        if abs(dx) < 0.001 and abs(dpx) < 0.5 and abs(dpy) < 0.5:
+            self._zoom_level = self._target_zoom
+            self._pan_x = self._target_pan_x
+            self._pan_y = self._target_pan_y
+            self._zoom_pan_timer.stop()
+
+        self.update()
+
+    def wheelEvent(self, event):
+        """Zoom in/out with scroll wheel, centered on mouse position."""
+        delta = event.angleDelta().y()
+        factor = 1.1 if delta > 0 else 1 / 1.1
+        new_zoom = self._target_zoom * factor
+        new_zoom = max(0.25, min(10.0, new_zoom))
+        self._target_zoom = new_zoom
+        if not self._zoom_pan_timer.isActive():
+            self._zoom_pan_timer.start()
+
+    # ------------------------------------------------------------------
+    # Resize debounce
+    # ------------------------------------------------------------------
+
+    def _on_resize_debounced(self):
+        """Called after resize settles — rebuild caches."""
+        self._invalidate_screen_cache()
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._resize_timer.start()  # Debounce: rebuild after 50ms settle
+
     def mouseMoveEvent(self, event):
         if self._centroids is None:
             return
         pos = event.position()
+
+        # Handle panning when middle button or right button is held
+        if self._is_panning:
+            dx = pos.x() - self._pan_start.x()
+            dy = pos.y() - self._pan_start.y()
+            self._target_pan_x = self._pan_start_offset[0] + dx
+            self._target_pan_y = self._pan_start_offset[1] + dy
+            if not self._zoom_pan_timer.isActive():
+                self._zoom_pan_timer.start()
+            return
+
+        self._hover_pos = pos
         closest, min_d = -1, 60
         for k in range(self._n_clusters):
             cx, cy = self._to_screen(self._centroids[k, 0], self._centroids[k, 1])
@@ -596,10 +1191,30 @@ class ClusterCanvas(QWidget):
             self.update()
 
     def mousePressEvent(self, event):
+        # Middle or right button starts panning
+        if event.button() in (Qt.MouseButton.MiddleButton, Qt.MouseButton.RightButton):
+            self._is_panning = True
+            self._pan_start = event.position()
+            self._pan_start_offset = (self._target_pan_x, self._target_pan_y)
+            self.setCursor(Qt.CursorShape.ClosedHandCursor)
+            return
         if self._hovered_cluster >= 0:
             self._selected_cluster = self._hovered_cluster
             self.cluster_clicked.emit(self._selected_cluster)
             self.update()
+
+    def mouseReleaseEvent(self, event):
+        if event.button() in (Qt.MouseButton.MiddleButton, Qt.MouseButton.RightButton):
+            self._is_panning = False
+            self.setCursor(Qt.CursorShape.ArrowCursor)
+
+    def mouseDoubleClickEvent(self, event):
+        """Double-click to reset zoom/pan."""
+        self._target_zoom = 1.0
+        self._target_pan_x = 0.0
+        self._target_pan_y = 0.0
+        if not self._zoom_pan_timer.isActive():
+            self._zoom_pan_timer.start()
 
 
 # ---------------------------------------------------------------------------
@@ -666,39 +1281,27 @@ class ClusterView(QWidget):
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(0)
 
-        tb = QHBoxLayout()
-        tb.setContentsMargins(12, 8, 12, 8)
-        tb.setSpacing(10)
+        tb_w, tb = build_toolbar("Cluster Distribution")
 
-        title = QLabel("Cluster Distribution")
-        title.setStyleSheet(f"color: {Colors.TEXT}; font-size: 14px; font-weight: 700;")
-        tb.addWidget(title)
-
-        tb.addWidget(QLabel("Projection:"))
+        # Projection selector (insert before the stretch)
+        tb.insertWidget(tb.count() - 1, QLabel("Projection:"))
         self.proj_combo = QComboBox()
         self.proj_combo.addItems(["PCA", "t-SNE", "First 2 Dims"])
         self.proj_combo.setCurrentText("First 2 Dims")
         self.proj_combo.currentTextChanged.connect(self._rebuild)
-        tb.addWidget(self.proj_combo)
+        tb.insertWidget(tb.count() - 1, self.proj_combo)
 
-        tb.addWidget(QLabel("K:"))
+        tb.insertWidget(tb.count() - 1, QLabel("K:"))
         self.k_slider = QSlider(Qt.Horizontal)
         self.k_slider.setRange(2, 12)
         self.k_slider.setValue(5)
         self.k_slider.setFixedWidth(80)
         self.k_slider.valueChanged.connect(self._rebuild)
-        tb.addWidget(self.k_slider)
+        tb.insertWidget(tb.count() - 1, self.k_slider)
         self.k_label = QLabel("5")
         self.k_label.setStyleSheet(f"color: {Colors.ACCENT}; font-weight: 700;")
-        tb.addWidget(self.k_label)
+        tb.insertWidget(tb.count() - 1, self.k_label)
 
-        tb.addStretch()
-
-        tb_w = QWidget()
-        tb_w.setLayout(tb)
-        tb_w.setStyleSheet(
-            f"background-color: {Colors.BG_RAISED}; border-bottom: 1px solid {Colors.BORDER};"
-        )
         layout.addWidget(tb_w)
 
         splitter = QSplitter(Qt.Horizontal)

@@ -459,19 +459,69 @@ class EngineManager(QObject):
     # ── Health check ───────────────────────────────────────────────
 
     def _check_health(self):
-        for name, config in self._engines.items():
+        for name, config in list(self._engines.items()):
             status = self._statuses.get(name)
             if status in (EngineStatus.RUNNING, EngineStatus.STARTING):
                 try:
                     import httpx
-                    r = httpx.get(f"{config.url}/health", timeout=2.0)
+                    r = httpx.get(
+                        f"{config.url}/health",
+                        timeout=5.0,  # explicit 5 s timeout
+                    )
                     if r.status_code == 200:
-                        self._statuses[name] = EngineStatus.RUNNING
+                        if status == EngineStatus.ERROR:
+                            # Recovered
+                            self._statuses[name] = EngineStatus.RUNNING
+                            self.status_changed.emit(name, EngineStatus.RUNNING.value)
                     else:
-                        self._statuses[name] = EngineStatus.ERROR
+                        if status == EngineStatus.RUNNING:
+                            self._statuses[name] = EngineStatus.ERROR
+                            self.status_changed.emit(name, EngineStatus.ERROR.value)
                 except Exception:
                     if status == EngineStatus.RUNNING:
                         self._statuses[name] = EngineStatus.ERROR
+                        self.status_changed.emit(name, EngineStatus.ERROR.value)
+                        # ── Auto-restart on crash ──
+                        self._auto_restart_if_needed(name, config)
+
+    def _auto_restart_if_needed(self, name: str, config: EngineConfig):
+        """Auto-restart a crashed local engine (up to 3 attempts)."""
+        if config.engine_type == "remote":
+            return  # Don't try to restart remote engines
+
+        attempts = getattr(self, f"_restart_attempts_{name}", 0)
+        max_attempts = 3
+        if attempts >= max_attempts:
+            self.engine_error.emit(
+                name,
+                f"Engine crashed and failed to restart after {max_attempts} attempts.",
+            )
+            return
+
+        setattr(self, f"_restart_attempts_{name}", attempts + 1)
+        self.engine_error.emit(name, f"Engine appears down — auto-restarting (attempt {attempts + 1}/{max_attempts})")
+
+        # Reset the counter on successful restart via a single-shot timer
+        from PySide6.QtCore import QTimer
+        QTimer.singleShot(10_000, lambda: self._clear_restart_counter(name))
+
+        self.start_engine(name)
+
+    def _clear_restart_counter(self, name: str):
+        """Clear restart attempt counter if the engine is running."""
+        if self._statuses.get(name) == EngineStatus.RUNNING:
+            if hasattr(self, f"_restart_attempts_{name}"):
+                delattr(self, f"_restart_attempts_{name}")
+
+    # ── Cleanup ───────────────────────────────────────────────────
+
+    def shutdown(self):
+        """Stop all engines and clean up resources."""
+        self._health_timer.stop()
+        for name in list(self._processes.keys()):
+            self.stop_engine(name)
+        self._processes.clear()
+        self._statuses.clear()
 
     # ── Discovery ──────────────────────────────────────────────────
 

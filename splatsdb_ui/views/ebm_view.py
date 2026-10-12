@@ -40,16 +40,18 @@ from typing import Optional
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
     QComboBox, QSlider, QCheckBox, QSizePolicy, QFrame,
+    QFileDialog,
 )
-from PySide6.QtCore import Signal, Qt, QTimer, QPointF, QRectF
+from PySide6.QtCore import Signal, Qt, QTimer, QPointF, QRectF, QPropertyAnimation, QEasingCurve
 from PySide6.QtGui import (
     QPainter, QColor, QPen, QBrush, QFont,
     QRadialGradient, QLinearGradient, QPainterPath, QPolygonF,
-    QImage, QPixmap,
+    QImage, QPixmap, QCursor,
 )
 
 from splatsdb_ui.utils.theme import Colors
 from splatsdb_ui.utils.icons import icon
+from splatsdb_ui.utils.widgets import build_toolbar, build_info_bar, make_button
 
 # ---------------------------------------------------------------------------
 # EBM math engine — pure Python port of the Rust backend
@@ -141,24 +143,51 @@ class EBMEngine:
         return grad
 
     def energy_grid(self, x_range: tuple, y_range: tuple, resolution: int) -> np.ndarray:
-        """Compute energy on a 2D grid."""
-        xs = np.linspace(x_range[0], x_range[1], resolution)
-        ys = np.linspace(y_range[0], y_range[1], resolution)
-        grid = np.zeros((resolution, resolution), dtype=np.float32)
-        for i, y in enumerate(ys):
-            for j, x in enumerate(xs):
-                grid[i, j] = self.energy(np.array([x, y]))
-        return grid
+        """Compute energy on a 2D grid using vectorized numpy broadcasting.
+
+        Instead of a Python double for-loop calling self.energy() per point,
+        we build the full grid of (x, y) coordinates and compute all distances
+        and energies in one batch using numpy broadcasting.
+        """
+        if not self.mu:
+            return np.zeros((resolution, resolution), dtype=np.float32)
+
+        xs = np.linspace(x_range[0], x_range[1], resolution, dtype=np.float64)
+        ys = np.linspace(y_range[0], y_range[1], resolution, dtype=np.float64)
+
+        # Build (resolution, resolution, 2) grid of world coordinates
+        # grid_yx[i, j] = [xs[j], ys[i]]  (matches old loop order: i=y-row, j=x-col)
+        xx, yy = np.meshgrid(xs, ys)  # each shape (resolution, resolution)
+        grid_points = np.stack([xx, yy], axis=-1)  # (R, R, 2)
+
+        # Convert splat parameters to arrays
+        mu_arr = np.array(self.mu, dtype=np.float64)   # (N, 2)
+        alpha_arr = np.array(self.alpha, dtype=np.float64)  # (N,)
+        kappa_arr = np.array(self.kappa, dtype=np.float64)  # (N,)
+
+        # Compute squared distances: ||x - mu_i||^2
+        # grid_points: (R, R, 2) -> (R, R, 1, 2)
+        # mu_arr:      (N, 2)    -> (1, 1, N, 2)
+        diff = grid_points[:, :, np.newaxis, :] - mu_arr[np.newaxis, np.newaxis, :, :]  # (R, R, N, 2)
+        d2 = np.sum(diff ** 2, axis=-1)  # (R, R, N)
+
+        # Energy computation: alpha_i * exp(-kappa_i * d2_i)
+        exp_terms = alpha_arr[np.newaxis, np.newaxis, :] * np.exp(-kappa_arr[np.newaxis, np.newaxis, :] * d2)  # (R, R, N)
+        total = np.sum(exp_terms, axis=-1)  # (R, R)
+
+        # E(x) = -log(total), clamp to 10.0 where total is tiny
+        grid = np.where(total < 1e-10, 10.0, -np.log(np.maximum(total, 1e-300)))
+        return grid.astype(np.float32)
 
     @staticmethod
     def classify(energy: float) -> tuple[str, QColor]:
         """Classify energy into confidence zone."""
         if energy < 0.3:
-            return "high_confidence", QColor(34, 197, 94)   # green
+            return "high_confidence", QColor(Colors.CONFIDENCE_HIGH)
         elif energy < 0.7:
-            return "moderate", QColor(245, 158, 11)         # amber
+            return "moderate", QColor(Colors.CONFIDENCE_MOD)
         else:
-            return "uncertain", QColor(239, 68, 68)          # red
+            return "uncertain", QColor(Colors.CONFIDENCE_LOW)
 
     def free_energy(self) -> float:
         """F = -log(Z), Z = Σαᵢ"""
@@ -335,6 +364,9 @@ class EBMCanvas(QWidget):
         self._grid_y_range = (-15, 15)
         self._grid_resolution = 80
         self._heatmap_cache: Optional[QImage] = None
+        self._cache_size: Optional[tuple[int, int]] = None
+        self._pixmap_cache: Optional[QPixmap] = None
+        self._pixmap_cache_key: Optional[tuple] = None
 
         self._show_gradient = True
         self._show_contours = True
@@ -348,6 +380,16 @@ class EBMCanvas(QWidget):
         self._drag_start = None
         self._pan_offset = QPointF(0, 0)
         self._zoom = 1.0
+        self._target_zoom = 1.0
+
+        # Hover position for energy tooltip (screen coords)
+        self._hover_screen_pos: Optional[QPointF] = None
+        self._crosshair_pos: Optional[QPointF] = None
+        self._show_crosshair = True
+
+        # Smooth color transition — blend factor between old and new heatmap
+        self._transition_alpha = 1.0  # 1.0 = fully showing new
+        self._prev_heatmap: Optional[QImage] = None
 
         # Avalanche animation
         self._avalanche_active = False
@@ -361,9 +403,20 @@ class EBMCanvas(QWidget):
         self._timer.timeout.connect(self._tick)
         self._timer.start(33)
 
-        # Deterministic star field
-        self._stars = [(random.Random(42 + i).random(), random.Random(42 + i + 100).random(),
-                        random.Random(42 + i + 200).randint(8, 25)) for i in range(60)]
+        # Deterministic star field with twinkling parameters
+        # Each star: (x_frac, y_frac, base_size, twinkle_speed, twinkle_phase, base_brightness)
+        self._stars = []
+        for i in range(80):
+            rng = random.Random(42 + i)
+            star = (
+                rng.random(),                              # x fraction
+                rng.random(),                              # y fraction
+                rng.randint(6, 28),                        # base size (subtle)
+                rng.uniform(0.5, 3.0),                     # twinkle speed
+                rng.uniform(0, 2 * math.pi),               # twinkle phase offset
+                rng.randint(40, 120),                      # base brightness
+            )
+            self._stars.append(star)
 
     def load_nodes(self, nodes: list[dict]):
         self._nodes = nodes
@@ -384,9 +437,32 @@ class EBMCanvas(QWidget):
         self._recompute_grid()
 
     def _recompute_grid(self):
+        # Store previous heatmap for smooth transition
+        if self._heatmap_cache is not None:
+            self._prev_heatmap = QImage(self._heatmap_cache)
+            self._transition_alpha = 0.0  # start fading in
+
         self._energy_grid = self._engine.energy_grid(
             self._grid_x_range, self._grid_y_range, self._grid_resolution)
         self._heatmap_cache = None
+        self._cache_size = None
+        self._pixmap_cache = None
+        self._pixmap_cache_key = None
+
+    def export_heatmap_png(self, path: str):
+        """Export the current heatmap as a PNG file."""
+        if self._heatmap_cache is not None:
+            self._heatmap_cache.save(path)
+        elif self._energy_grid is not None:
+            w, h = self.width(), self.height()
+            res = self._energy_grid.shape[0]
+            img = QImage(res, res, QImage.Format_ARGB32_Premultiplied)
+            for i in range(res):
+                for j in range(res):
+                    color = self._energy_to_color(self._energy_grid[i, j])
+                    img.setPixelColor(j, i, color)
+            scaled = img.scaled(w, h, Qt.IgnoreAspectRatio, Qt.SmoothTransformation)
+            scaled.save(path)
 
     # --- Settings ---
 
@@ -399,6 +475,7 @@ class EBMCanvas(QWidget):
     def set_contour_count(self, n: int):
         self._contour_count = n
         self._heatmap_cache = None
+        self._cache_size = None
         self.update()
 
     def trigger_avalanche(self):
@@ -460,6 +537,15 @@ class EBMCanvas(QWidget):
             self._avalanche_step += 1
             if self._avalanche_step >= len(self._avalanche_path) * 4:
                 self._avalanche_active = False
+
+        # Smooth zoom animation — ease toward target
+        if abs(self._zoom - self._target_zoom) > 0.001:
+            self._zoom += (self._target_zoom - self._zoom) * 0.15
+
+        # Smooth color transition — fade from old to new heatmap
+        if self._transition_alpha < 1.0:
+            self._transition_alpha = min(1.0, self._transition_alpha + 0.05)
+
         self.update()
 
     # --- Coordinate transforms ---
@@ -497,6 +583,9 @@ class EBMCanvas(QWidget):
         # 1. Energy heatmap
         self._paint_heatmap(painter, w, h)
 
+        # 1b. Twinkling star overlay
+        self._paint_stars(painter, w, h)
+
         # 2. Confidence zone overlays
         if self._show_zones:
             self._paint_zones(painter, w, h)
@@ -521,12 +610,24 @@ class EBMCanvas(QWidget):
         if self._avalanche_active:
             self._paint_avalanche(painter, w, h)
 
-        # 8. Hover info
+        # 8. Hover info (splat-level)
         if self._hovered_idx >= 0:
             self._paint_hover_info(painter, w, h)
 
-        # 9. Legend + info
+        # 9. Energy tooltip at cursor (grid-level)
+        self._paint_energy_tooltip(painter, w, h)
+
+        # 9b. Interactive crosshair cursor
+        self._paint_crosshair(painter, w, h)
+
+        # 10. Color scale legend (right side)
+        self._paint_color_scale(painter, w, h)
+
+        # 11. Legend + info (left side + top-right system info)
         self._paint_legend(painter, w, h)
+
+        # 12. Axis labels with scientific notation
+        self._paint_axes(painter, w, h)
 
         painter.end()
 
@@ -540,82 +641,112 @@ class EBMCanvas(QWidget):
         """
         t = min(e / 2.0, 1.0)  # normalize to [0,1]
 
-        if t < 0.15:
-            # Deep blue → dark teal
-            r = int(10 + t / 0.15 * 20)
-            g = int(20 + t / 0.15 * 60)
-            b = int(80 + t / 0.15 * 40)
-        elif t < 0.35:
-            # Teal → green
-            s = (t - 0.15) / 0.2
-            r = int(30 - s * 10)
-            g = int(80 + s * 80)
-            b = int(120 - s * 70)
-        elif t < 0.55:
-            # Green → amber
-            s = (t - 0.35) / 0.2
-            r = int(20 + s * 180)
-            g = int(160 + s * 20)
-            b = int(50 - s * 30)
-        elif t < 0.75:
-            # Amber → orange
-            s = (t - 0.55) / 0.2
-            r = int(200 + s * 40)
-            g = int(180 - s * 80)
-            b = int(20)
-        else:
-            # Orange → crimson
-            s = (t - 0.75) / 0.25
-            r = int(240 - s * 20)
-            g = int(100 - s * 70)
-            b = int(20 + s * 20)
+        # Anchor colors from theme constants
+        cold  = QColor(Colors.THERMAL_COLD)
+        teal  = QColor(Colors.THERMAL_TEAL)
+        green = QColor(Colors.THERMAL_GREEN)
+        amber = QColor(Colors.THERMAL_AMBER)
+        hot   = QColor(Colors.THERMAL_HOT)
 
-        return QColor(
-            max(0, min(255, r)),
-            max(0, min(255, g)),
-            max(0, min(255, b)),
-        )
+        if t < 0.15:
+            return Colors.lerp_color(cold, teal, t / 0.15)
+        elif t < 0.35:
+            return Colors.lerp_color(teal, green, (t - 0.15) / 0.2)
+        elif t < 0.55:
+            return Colors.lerp_color(green, amber, (t - 0.35) / 0.2)
+        elif t < 0.75:
+            return Colors.lerp_color(amber, QColor(240, 100, 20), (t - 0.55) / 0.2)
+        else:
+            return Colors.lerp_color(QColor(240, 100, 20), hot, (t - 0.75) / 0.25)
 
     def _paint_heatmap(self, painter: QPainter, w: int, h: int):
-        """Render energy field as thermal heatmap."""
-        if self._heatmap_cache and self._heatmap_cache.size() == self.size():
+        """Render energy field as thermal heatmap with QPixmap caching and smooth transitions."""
+        # Build QImage cache if needed
+        if self._heatmap_cache is None or self._cache_size != (w, h):
+            grid = self._energy_grid
+            if grid is None:
+                return
+
+            res = grid.shape[0]
+            img = QImage(res, res, QImage.Format_ARGB32_Premultiplied)
+
+            for i in range(res):
+                for j in range(res):
+                    color = self._energy_to_color(grid[i, j])
+                    img.setPixelColor(j, i, color)
+
+            # Scale to widget size
+            scaled = img.scaled(w, h, Qt.IgnoreAspectRatio, Qt.SmoothTransformation)
+            self._heatmap_cache = scaled
+            self._cache_size = (w, h)
+            self._pixmap_cache = None  # invalidate pixmap too
+
+        # Render previous heatmap during transition
+        if self._transition_alpha < 1.0 and self._prev_heatmap is not None:
+            prev_scaled = self._prev_heatmap.scaled(w, h, Qt.IgnoreAspectRatio, Qt.SmoothTransformation)
+            painter.drawImage(0, 0, prev_scaled)
+            # Overlay new heatmap with transition alpha
+            painter.setOpacity(self._transition_alpha)
             painter.drawImage(0, 0, self._heatmap_cache)
+            painter.setOpacity(1.0)
+        else:
+            # Use QPixmap cache for faster blitting
+            cache_key = (w, h)
+            if self._pixmap_cache is None or self._pixmap_cache_key != cache_key:
+                self._pixmap_cache = QPixmap.fromImage(self._heatmap_cache)
+                self._pixmap_cache_key = cache_key
+            painter.drawPixmap(0, 0, self._pixmap_cache)
+
+    def _paint_stars(self, painter: QPainter, w: int, h: int):
+        """Twinkling star field overlay — visible in low-energy (dark) regions."""
+        if self._energy_grid is None:
             return
 
-        grid = self._energy_grid
-        if grid is None:
-            return
+        t = self._time
+        for (x_frac, y_frac, base_size, speed, phase, base_bright) in self._stars:
+            # Twinkling: sinusoidal brightness modulation
+            twinkle = 0.5 + 0.5 * math.sin(t * speed + phase)
+            brightness = int(base_bright * (0.3 + 0.7 * twinkle))
+            if brightness < 10:
+                continue
 
-        res = grid.shape[0]
-        img = QImage(res, res, QImage.Format_ARGB32_Premultiplied)
+            sx = x_frac * w
+            sy = y_frac * h
+            size = base_size * (0.6 + 0.4 * twinkle)
 
-        e_min = float(grid.min())
-        e_max = float(grid.max())
-        if e_max - e_min < 1e-6:
-            e_max = e_min + 1.0
+            # Warm star color (slight golden tint fits thermal theme)
+            r = min(255, brightness + 30)
+            g = min(255, brightness + 15)
+            b = min(255, brightness)
 
-        for i in range(res):
-            for j in range(res):
-                # Normalize energy to [0,1]
-                t = (grid[i, j] - e_min) / (e_max - e_min)
-                color = self._energy_to_color(grid[i, j])
-                img.setPixelColor(j, i, color)
+            # Soft glow
+            glow = QRadialGradient(QPointF(sx, sy), size)
+            glow.setColorAt(0.0, QColor(r, g, b, brightness))
+            glow.setColorAt(0.4, QColor(r, g, b, int(brightness * 0.4)))
+            glow.setColorAt(1.0, QColor(r, g, b, 0))
 
-        # Scale to widget size
-        scaled = img.scaled(w, h, Qt.IgnoreAspectRatio, Qt.SmoothTransformation)
-        self._heatmap_cache = scaled
-        painter.drawImage(0, 0, scaled)
+            painter.setPen(Qt.NoPen)
+            painter.setBrush(QBrush(glow))
+            painter.drawEllipse(QPointF(sx, sy), size, size)
+
+            # Bright core dot
+            if brightness > 60:
+                core_alpha = min(255, brightness + 40)
+                painter.setBrush(QBrush(QColor(255, 255, 240, core_alpha)))
+                painter.drawEllipse(QPointF(sx, sy), max(1.0, size * 0.12), max(1.0, size * 0.12))
 
     def _paint_zones(self, painter: QPainter, w: int, h: int):
-        """Paint confidence zone boundaries."""
+        """Paint confidence zone boundaries with pulsing glow on high-energy zones."""
         grid = self._energy_grid
         if grid is None:
             return
+
+        t = self._time
 
         # Draw zone boundaries at E=0.3 and E=0.7
         for level, color, label in [
-            (0.3, QColor(34, 197, 94, 120), "High confidence"),
-            (0.7, QColor(239, 68, 68, 120), "Low confidence"),
+            (0.3, QColor(Colors.CONFIDENCE_HIGH), "High confidence"),
+            (0.7, QColor(Colors.CONFIDENCE_LOW), "Low confidence"),
         ]:
             paths = marching_squares(grid, level, self._grid_x_range, self._grid_y_range)
             for path_pts in paths:
@@ -628,8 +759,50 @@ class EBMCanvas(QWidget):
                 painter.setBrush(Qt.NoBrush)
                 painter.drawPolyline(poly)
 
+        # Pulsing glow on high-energy zones
+        if self._energy_grid is not None:
+            res = self._energy_grid.shape[0]
+            pulse_t = 0.5 + 0.5 * math.sin(t * 1.8)
+            # Sample sparse grid for high-energy hotspots
+            for i in range(0, res, 6):
+                for j in range(0, res, 6):
+                    e = self._energy_grid[i, j]
+                    if e < 0.6:
+                        continue
+                    x = self._grid_x_range[0] + j / res * (self._grid_x_range[1] - self._grid_x_range[0])
+                    y = self._grid_y_range[0] + i / res * (self._grid_y_range[1] - self._grid_y_range[0])
+                    sp = self._world_to_screen(x, y)
+
+                    # Pulsing radius and alpha
+                    base_r = 12 + e * 10
+                    radius = base_r * (0.8 + 0.4 * pulse_t)
+                    glow_alpha = int(40 * min(e, 1.5) * (0.6 + 0.4 * pulse_t))
+
+                    # Multi-ring glow
+                    for ring in range(3):
+                        r_mult = 1.0 + ring * 0.5
+                        ring_alpha = max(0, glow_alpha - ring * 12)
+                        if ring_alpha <= 0:
+                            continue
+
+                        glow = QRadialGradient(QPointF(0, 0), radius * r_mult)
+                        # Crimson/amber pulse
+                        cr = min(255, 200 + int(55 * pulse_t))
+                        cg = int(80 - 30 * pulse_t)
+                        cb = int(30 + 20 * pulse_t)
+                        glow.setColorAt(0.0, QColor(cr, cg, cb, ring_alpha))
+                        glow.setColorAt(0.6, QColor(cr, cg // 2, cb, ring_alpha // 3))
+                        glow.setColorAt(1.0, QColor(cr, 0, cb, 0))
+
+                        painter.setPen(Qt.NoPen)
+                        painter.setBrush(QBrush(glow))
+                        painter.save()
+                        painter.translate(sp)
+                        painter.drawEllipse(QPointF(0, 0), radius * r_mult, radius * r_mult)
+                        painter.restore()
+
     def _paint_contours(self, painter: QPainter, w: int, h: int):
-        """Golden-ratio iso-contour lines."""
+        """Golden-ratio iso-contour lines with smooth thermal color transitions and labels."""
         grid = self._energy_grid
         if grid is None:
             return
@@ -641,14 +814,26 @@ class EBMCanvas(QWidget):
 
         # Golden-ratio contour spacing
         n = self._contour_count
+        t = self._time
         for k in range(n):
-            t = (k + 1) / (n + 1)
-            level = e_min + t * (e_max - e_min)
+            frac = (k + 1) / (n + 1)
+            level = e_min + frac * (e_max - e_min)
 
-            # Contour opacity fades with index
-            alpha = int(180 * (1.0 - 0.4 * k / n))
-            pen_color = QColor(255, 255, 255, alpha)
-            painter.setPen(QPen(pen_color, 1.2))
+            # Smooth thermal contour color based on energy level
+            base_color = self._energy_to_color(level)
+            # Add subtle time-based shimmer
+            shimmer = 0.85 + 0.15 * math.sin(t * 0.8 + k * 0.7)
+            r = min(255, int(base_color.red() * shimmer + 60 * (1 - frac)))
+            g = min(255, int(base_color.green() * shimmer + 40 * (1 - frac)))
+            b = min(255, int(base_color.blue() * shimmer + 80 * (1 - frac)))
+
+            # Contour opacity fades with index, with gentle pulse
+            alpha_base = 160 * (1.0 - 0.3 * k / n)
+            alpha_pulse = alpha_base * (0.85 + 0.15 * math.sin(t * 1.2 + k * PHI))
+            alpha = int(max(30, min(220, alpha_pulse)))
+
+            contour_color = QColor(r, g, b, alpha)
+            painter.setPen(QPen(contour_color, 1.2))
             painter.setBrush(Qt.NoBrush)
 
             paths = marching_squares(grid, level, self._grid_x_range, self._grid_y_range)
@@ -658,18 +843,33 @@ class EBMCanvas(QWidget):
                 screen_pts = [self._world_to_screen(p.x(), p.y()) for p in path_pts]
                 painter.drawPolyline(QPolygonF(screen_pts))
 
+                # Contour label at midpoint of each path
+                if len(screen_pts) > 4:
+                    mid = len(screen_pts) // 2
+                    lp = screen_pts[mid]
+                    painter.setFont(QFont("monospace", 6))
+                    label_color = QColor(r, g, b, min(255, alpha + 40))
+                    painter.setPen(label_color)
+                    # Scientific notation for energy values
+                    if abs(level) < 0.01 or abs(level) >= 1000:
+                        label = f"{level:.1e}"
+                    else:
+                        label = f"{level:.2f}"
+                    painter.drawText(int(lp.x() + 4), int(lp.y() - 4), label)
+
     def _paint_gradient_field(self, painter: QPainter, w: int, h: int):
-        """Draw energy gradient arrows ∇E(x)."""
+        """Draw energy gradient arrows ∇E(x) with flowing animation."""
         if not self._engine.mu:
             return
 
+        t = self._time
         xr, yr = self._grid_x_range, self._grid_y_range
         spacing = 8  # arrows per axis
         xs = np.linspace(xr[0] + 0.5, xr[1] - 0.5, spacing)
         ys = np.linspace(yr[0] + 0.5, yr[1] - 0.5, spacing)
 
-        for y in ys:
-            for x in xs:
+        for iy, y in enumerate(ys):
+            for ix, x in enumerate(xs):
                 pt = np.array([x, y])
                 e = self._engine.energy(pt)
                 grad = self._engine.gradient(pt)
@@ -679,17 +879,23 @@ class EBMCanvas(QWidget):
                 if mag < 0.01:
                     continue
 
-                # Normalize and scale arrow
+                # Normalize and scale arrow with flowing animation
                 direction = grad / mag
-                arrow_len = min(mag * 15, 25)
+                # Subtle oscillation in arrow length — "flowing" effect
+                flow_phase = t * 1.5 + ix * 0.4 + iy * 0.3
+                flow_mod = 0.85 + 0.15 * math.sin(flow_phase)
+                arrow_len = min(mag * 15, 25) * flow_mod
                 end = pt + direction * arrow_len * 0.1
 
                 sp = self._world_to_screen(x, y)
                 ep = self._world_to_screen(float(end[0]), float(end[1]))
 
-                # Color by energy
+                # Color by energy with flowing alpha
                 _, color = EBMEngine.classify(e)
-                color.setAlpha(int(40 + min(e * 60, 160)))
+                base_alpha = int(40 + min(e * 60, 160))
+                # Pulsing alpha for "energy flow" feel
+                alpha_pulse = base_alpha * (0.8 + 0.2 * math.sin(flow_phase + 0.5))
+                color.setAlpha(int(max(20, min(255, alpha_pulse))))
 
                 painter.setPen(QPen(color, 1.0))
                 painter.drawLine(sp, ep)
@@ -740,7 +946,7 @@ class EBMCanvas(QWidget):
 
             # Pulsing glow
             glow = QRadialGradient(QPointF(0, 0), radius)
-            rc = QColor(239, 68, 68)
+            rc = QColor(Colors.CONFIDENCE_LOW)
             glow.setColorAt(0.0, QColor(rc.red(), rc.green(), rc.blue(), int(60 * min(e, 1))))
             glow.setColorAt(0.5, QColor(rc.red(), rc.green(), rc.blue(), int(20 * min(e, 1))))
             glow.setColorAt(1.0, QColor(rc.red(), rc.green(), rc.blue(), 0))
@@ -753,7 +959,9 @@ class EBMCanvas(QWidget):
             painter.restore()
 
             # Dashed circle
-            painter.setPen(QPen(QColor(239, 68, 68, int(80 * min(e, 1))), 1, Qt.DashLine))
+            low_color = QColor(Colors.CONFIDENCE_LOW)
+            low_color.setAlpha(int(80 * min(e, 1)))
+            painter.setPen(QPen(low_color, 1, Qt.DashLine))
             painter.setBrush(Qt.NoBrush)
             painter.save()
             painter.translate(sp)
@@ -870,7 +1078,8 @@ class EBMCanvas(QWidget):
             fade = max(0, 1.0 - age / 40.0)
 
             ring_alpha = int(200 * fade)
-            ring_color = QColor(245, 158, 11, ring_alpha)
+            ring_color = QColor(Colors.ACCENT)
+            ring_color.setAlpha(ring_alpha)
             painter.setPen(QPen(ring_color, 2.5 * fade))
             painter.setBrush(Qt.NoBrush)
             painter.save()
@@ -903,7 +1112,9 @@ class EBMCanvas(QWidget):
 
             age = step - k * 3
             fade = max(0, 1.0 - age / 30.0)
-            painter.setPen(QPen(QColor(245, 158, 11, int(150 * fade)), 2.0 * fade))
+            line_color = QColor(Colors.ACCENT)
+            line_color.setAlpha(int(150 * fade))
+            painter.setPen(QPen(line_color, 2.0 * fade))
             painter.drawLine(sp1, sp2)
 
     def _paint_hover_info(self, painter: QPainter, w: int, h: int):
@@ -931,6 +1142,187 @@ class EBMCanvas(QWidget):
         painter.drawText(w - 212, h - 42, f"Zone: {zone_name}")
         painter.setPen(QColor(Colors.TEXT_DIM))
         painter.drawText(w - 212, h - 27, f"Free energy F = {self._engine.free_energy():.4f}")
+
+    # --- Energy tooltip (grid-level hover) ---
+
+    def _energy_at_screen(self, sx: float, sy: float) -> Optional[float]:
+        """Sample energy grid at screen coordinates."""
+        grid = self._energy_grid
+        if grid is None:
+            return None
+        w, h = self.width(), self.height()
+        if w <= 0 or h <= 0:
+            return None
+
+        # Convert screen to grid indices
+        res = grid.shape[0]
+        gj = sx / w * res
+        gi = (1.0 - sy / h) * res
+
+        # Bilinear interpolation
+        gi0 = int(gi)
+        gj0 = int(gj)
+        if gi0 < 0 or gi0 >= res - 1 or gj0 < 0 or gj0 >= res - 1:
+            if 0 <= gi0 < res and 0 <= gj0 < res:
+                return float(grid[gi0, gj0])
+            return None
+
+        fi = gi - gi0
+        fj = gj - gj0
+        e00 = float(grid[gi0, gj0])
+        e01 = float(grid[gi0, gj0 + 1])
+        e10 = float(grid[gi0 + 1, gj0])
+        e11 = float(grid[gi0 + 1, gj0 + 1])
+        e = e00 * (1 - fi) * (1 - fj) + e01 * (1 - fi) * fj + e10 * fi * (1 - fj) + e11 * fi * fj
+        return e
+
+    def _paint_energy_tooltip(self, painter: QPainter, w: int, h: int):
+        """Show a floating tooltip with energy value at the cursor position on the grid."""
+        pos = self._hover_screen_pos
+        if pos is None:
+            return
+        # Only show if not hovering a splat (splat has its own tooltip)
+        if self._hovered_idx >= 0:
+            return
+
+        energy = self._energy_at_screen(pos.x(), pos.y())
+        if energy is None:
+            return
+
+        confidence = 1.0 / (1.0 + energy)
+        zone_name, _ = EBMEngine.classify(energy)
+        color = self._energy_to_color(energy)
+
+        # World coordinates
+        wx, wy = self._screen_to_world(pos.x(), pos.y())
+
+        # Tooltip content
+        lines = [
+            f"E = {energy:.3f}",
+            f"C = {confidence:.3f}",
+            f"({wx:.1f}, {wy:.1f})",
+            zone_name,
+        ]
+
+        font = QFont("monospace", 8)
+        painter.setFont(font)
+        fm = painter.fontMetrics()
+        line_h = fm.height()
+        max_tw = max(fm.horizontalAdvance(l) for l in lines)
+        pad_x, pad_y = 6, 4
+        tip_w = max_tw + pad_x * 2
+        tip_h = line_h * len(lines) + pad_y * 2
+
+        # Position tooltip offset from cursor, keep inside widget
+        tx = pos.x() + 16
+        ty = pos.y() - tip_h - 8
+        if tx + tip_w > w - 10:
+            tx = pos.x() - tip_w - 16
+        if ty < 10:
+            ty = pos.y() + 16
+
+        # Background
+        bg = QColor(Colors.BG_RAISED)
+        bg.setAlpha(220)
+        painter.setPen(Qt.NoPen)
+        painter.setBrush(QBrush(bg))
+        painter.drawRoundedRect(int(tx), int(ty), int(tip_w), int(tip_h), 5, 5)
+
+        # Left accent bar colored by energy
+        painter.setBrush(QBrush(color))
+        painter.drawRoundedRect(int(tx), int(ty), 3, int(tip_h), 2, 2)
+
+        # Text
+        text_colors = [
+            QColor(Colors.TEXT),
+            QColor(Colors.TEXT_DIM),
+            QColor(Colors.TEXT_DIM),
+            color.lighter(130),
+        ]
+        for i, line in enumerate(lines):
+            painter.setPen(text_colors[i])
+            painter.drawText(int(tx + pad_x + 4), int(ty + pad_y + line_h * (i + 1) - 2), line)
+
+    # --- Color scale legend (right side) ---
+
+    def _paint_color_scale(self, painter: QPainter, w: int, h: int):
+        """Render the energy color scale legend on the right side of the canvas.
+
+        Vertical gradient bar mapping energy values (0..2+) to the thermal
+        color palette (blue=cold → teal → green → amber → red=hot).
+        """
+        # Dimensions
+        bar_w = 16
+        bar_h = min(240, h - 100)
+        if bar_h < 60:
+            return
+        bar_x = w - bar_w - 50
+        bar_y = 90  # below the system info box
+
+        # Semi-transparent background panel
+        panel_pad = 6
+        panel_x = bar_x - panel_pad
+        panel_y = bar_y - 24  # room for title
+        panel_w = bar_w + 42 + panel_pad * 2
+        panel_h = bar_h + 24 + panel_pad * 2
+
+        bg = QColor(Colors.BG_RAISED)
+        bg.setAlpha(200)
+        painter.setPen(Qt.NoPen)
+        painter.setBrush(QBrush(bg))
+        painter.drawRoundedRect(panel_x, panel_y, panel_w, panel_h, 6, 6)
+
+        # Title
+        painter.setFont(QFont("monospace", 7, QFont.Bold))
+        painter.setPen(QColor(Colors.TEXT))
+        painter.drawText(panel_x + panel_pad, bar_y - 8, "ENERGY SCALE")
+
+        # Draw gradient bar: top=hot (high E), bottom=cold (low E)
+        for i in range(bar_h):
+            frac = 1.0 - i / bar_h  # 1 at top, 0 at bottom
+            e = frac * 2.0           # energy value
+            color = self._energy_to_color(e)
+            painter.setPen(QPen(color))
+            painter.drawLine(bar_x, bar_y + i, bar_x + bar_w, bar_y + i)
+
+        # Border
+        painter.setPen(QPen(QColor(Colors.TEXT_DIM), 1))
+        painter.setBrush(Qt.NoBrush)
+        painter.drawRect(bar_x, bar_y, bar_w, bar_h)
+
+        # Tick marks and labels
+        painter.setFont(QFont("monospace", 7))
+        painter.setPen(QColor(Colors.TEXT_DIM))
+        ticks = [
+            (0.0, "0.0 Cold", QColor(100, 140, 220)),     # bottom = cold blue
+            (0.15, "0.3", QColor(80, 180, 100)),            # teal-green
+            (0.5, "1.0", QColor(245, 180, 30)),             # amber
+            (0.75, "1.5", QColor(230, 100, 30)),            # orange
+            (1.0, "2.0+ Hot", QColor(220, 50, 50)),         # top = hot red
+        ]
+        for frac, label, tick_color in ticks:
+            y = bar_y + int((1.0 - frac) * bar_h)
+            # Tick line
+            painter.setPen(QPen(tick_color, 1))
+            painter.drawLine(bar_x + bar_w, y, bar_x + bar_w + 4, y)
+            # Label
+            painter.setPen(tick_color.lighter(120))
+            painter.drawText(bar_x + bar_w + 6, y + 4, label)
+
+        # Confidence zone mini-legend below the bar
+        zone_y = bar_y + bar_h + 8
+        painter.setFont(QFont("monospace", 6))
+        for color_hex, label in [
+            (QColor(Colors.CONFIDENCE_HIGH), "High conf"),
+            (QColor(Colors.ACCENT), "Moderate"),
+            (QColor(Colors.CONFIDENCE_LOW), "Uncertain"),
+        ]:
+            painter.setPen(Qt.NoPen)
+            painter.setBrush(QBrush(color_hex))
+            painter.drawEllipse(QPointF(bar_x + 4, zone_y), 3, 3)
+            painter.setPen(QColor(Colors.TEXT_DIM))
+            painter.drawText(bar_x + 10, int(zone_y + 3), label)
+            zone_y += 12
 
     def _paint_legend(self, painter: QPainter, w: int, h: int):
         """Thermal legend + system info."""
@@ -965,9 +1357,9 @@ class EBMCanvas(QWidget):
         # Zone indicators
         zone_y = bar_y + bar_h + 22
         for color, label in [
-            (QColor(34, 197, 94), "High conf"),
-            (QColor(245, 158, 11), "Moderate"),
-            (QColor(239, 68, 68), "Uncertain"),
+            (QColor(Colors.CONFIDENCE_HIGH), "High conf"),
+            (QColor(Colors.ACCENT), "Moderate"),
+            (QColor(Colors.CONFIDENCE_LOW), "Uncertain"),
         ]:
             painter.setPen(Qt.NoPen)
             painter.setBrush(QBrush(color))
@@ -997,6 +1389,88 @@ class EBMCanvas(QWidget):
         painter.drawText(w - 187, 48, f"E(x) = -ln(Σ α·exp(-κ||x-μ||²))")
         painter.drawText(w - 187, 61, f"C(x) = 1/(1+E(x))")
 
+    # --- Crosshair and axis labels ---
+
+    def _paint_crosshair(self, painter: QPainter, w: int, h: int):
+        """Interactive crosshair cursor showing energy at position."""
+        pos = self._crosshair_pos
+        if pos is None or not self._show_crosshair:
+            return
+
+        sx, sy = pos.x(), pos.y()
+        if sx < 0 or sx > w or sy < 0 or sy > h:
+            return
+
+        energy = self._energy_at_screen(sx, sy)
+        if energy is None:
+            return
+
+        color = self._energy_to_color(energy)
+
+        # Crosshair lines
+        cross_pen = QPen(QColor(color.red(), color.green(), color.blue(), 80), 1, Qt.DashLine)
+        painter.setPen(cross_pen)
+        painter.drawLine(int(sx), 0, int(sx), h)
+        painter.drawLine(0, int(sy), w, int(sy))
+
+        # Crosshair center dot
+        painter.setPen(Qt.NoPen)
+        painter.setBrush(QBrush(QColor(color.red(), color.green(), color.blue(), 160)))
+        painter.drawEllipse(QPointF(sx, sy), 4, 4)
+
+        # Energy readout near cursor
+        wx, wy = self._screen_to_world(sx, sy)
+        painter.setFont(QFont("monospace", 8))
+        painter.setPen(QPen(QColor(color.red(), color.green(), color.blue(), 200)))
+        confidence = 1.0 / (1.0 + energy)
+        text = f"E={energy:.3f} C={confidence:.3f}"
+        if abs(energy) >= 1000:
+            text = f"E={energy:.1e} C={confidence:.3f}"
+        painter.drawText(int(sx + 10), int(sy - 10), text)
+
+    def _paint_axes(self, painter: QPainter, w: int, h: int):
+        """Axis labels with scientific notation for energy values."""
+        xr = self._grid_x_range
+        yr = self._grid_y_range
+
+        painter.setFont(QFont("monospace", 7))
+        painter.setPen(QColor(Colors.TEXT_DIM))
+
+        def sci_fmt(v: float) -> str:
+            """Format value with scientific notation when appropriate."""
+            if abs(v) < 0.01 and v != 0:
+                return f"{v:.1e}"
+            elif abs(v) >= 1000:
+                return f"{v:.1e}"
+            elif abs(v) >= 100:
+                return f"{v:.0f}"
+            else:
+                return f"{v:.1f}"
+
+        # X axis labels along bottom
+        n_x = 5
+        for i in range(n_x + 1):
+            frac = i / n_x
+            v = xr[0] + frac * (xr[1] - xr[0])
+            x = frac * w
+            painter.drawText(int(x - 15), h - 4, sci_fmt(v))
+            # Tick mark
+            painter.setPen(QPen(QColor(Colors.TEXT_DIM), 0.5))
+            painter.drawLine(int(x), h - 14, int(x), h - 8)
+            painter.setPen(QColor(Colors.TEXT_DIM))
+
+        # Y axis labels along left
+        n_y = 5
+        for i in range(n_y + 1):
+            frac = i / n_y
+            v = yr[1] - frac * (yr[1] - yr[0])  # top = max
+            y = frac * h
+            painter.drawText(2, int(y + 4), sci_fmt(v))
+            # Tick mark
+            painter.setPen(QPen(QColor(Colors.TEXT_DIM), 0.5))
+            painter.drawLine(0, int(y), 6, int(y))
+            painter.setPen(QColor(Colors.TEXT_DIM))
+
     # --- Mouse ---
 
     def mousePressEvent(self, event):
@@ -1011,9 +1485,35 @@ class EBMCanvas(QWidget):
     def mouseMoveEvent(self, event):
         pos = event.position()
         self._hover_at(pos)
+        self._hover_screen_pos = pos
+        self._crosshair_pos = pos
+        # Tooltip on hover
+        energy = self._energy_at_screen(pos.x(), pos.y())
+        if energy is not None and self._hovered_idx < 0:
+            wx, wy = self._screen_to_world(pos.x(), pos.y())
+            confidence = 1.0 / (1.0 + energy)
+            zone_name, _ = EBMEngine.classify(energy)
+            self.setToolTip(
+                f"E = {energy:.4f}\n"
+                f"C = {confidence:.4f}\n"
+                f"({wx:.2f}, {wy:.2f})\n"
+                f"Zone: {zone_name}"
+            )
+        else:
+            self.setToolTip("")
 
     def mouseReleaseEvent(self, event):
         self._drag_start = None
+
+    def wheelEvent(self, event):
+        """Smooth zoom with mouse wheel."""
+        delta = event.angleDelta().y()
+        zoom_factor = 1.15 if delta > 0 else 1.0 / 1.15
+        self._target_zoom = max(0.1, min(10.0, self._target_zoom * zoom_factor))
+        self._zoom = self._target_zoom  # direct for now; animation in _tick
+        self._heatmap_cache = None
+        self._cache_size = None
+        self._pixmap_cache = None
 
     def _hover_at(self, pos):
         best, best_d = -1, 30
@@ -1064,81 +1564,59 @@ class EBMView(QWidget):
         layout.setSpacing(0)
 
         # Toolbar
-        tb = QHBoxLayout()
-        tb.setContentsMargins(12, 8, 12, 8)
-        tb.setSpacing(10)
+        tb_w, tb = build_toolbar(
+            "EBM Energy Landscape",
+            subtitle="E(x) = -ln(Σ α·exp(-κ||x-μ||²))",
+        )
 
-        title = QLabel("EBM Energy Landscape")
-        title.setStyleSheet(f"color: {Colors.TEXT}; font-size: 14px; font-weight: 700;")
-        tb.addWidget(title)
-
-        sub = QLabel("E(x) = -ln(Σ α·exp(-κ||x-μ||²))")
-        sub.setStyleSheet(f"color: {Colors.TEXT_DIM}; font-size: 10px; font-family: monospace;")
-        tb.addWidget(sub)
-
-        tb.addStretch()
-
-        # Contour count
-        tb.addWidget(QLabel("Contours:"))
+        # Contour count (insert before stretch)
+        tb.insertWidget(tb.count() - 1, QLabel("Contours:"))
         self.contour_slider = QSlider(Qt.Horizontal)
         self.contour_slider.setRange(2, 16)
         self.contour_slider.setValue(8)
         self.contour_slider.setFixedWidth(80)
         self.contour_slider.valueChanged.connect(self._on_contours)
-        tb.addWidget(self.contour_slider)
+        tb.insertWidget(tb.count() - 1, self.contour_slider)
 
         # Toggles
         self.grad_cb = QCheckBox("∇E")
         self.grad_cb.setChecked(True)
         self.grad_cb.toggled.connect(lambda v: self.canvas.set_show_gradient(v))
-        tb.addWidget(self.grad_cb)
+        tb.insertWidget(tb.count() - 1, self.grad_cb)
 
         self.contour_cb = QCheckBox("Contours")
         self.contour_cb.setChecked(True)
         self.contour_cb.toggled.connect(lambda v: self.canvas.set_show_contours(v))
-        tb.addWidget(self.contour_cb)
+        tb.insertWidget(tb.count() - 1, self.contour_cb)
 
         self.splat_cb = QCheckBox("Splats")
         self.splat_cb.setChecked(True)
         self.splat_cb.toggled.connect(lambda v: self.canvas.set_show_splats(v))
-        tb.addWidget(self.splat_cb)
+        tb.insertWidget(tb.count() - 1, self.splat_cb)
 
         self.zone_cb = QCheckBox("Zones")
         self.zone_cb.setChecked(True)
         self.zone_cb.toggled.connect(lambda v: self.canvas.set_show_zones(v))
-        tb.addWidget(self.zone_cb)
+        tb.insertWidget(tb.count() - 1, self.zone_cb)
 
         self.explore_cb = QCheckBox("Explore")
         self.explore_cb.setChecked(True)
         self.explore_cb.toggled.connect(lambda v: self.canvas.set_show_exploration(v))
-        tb.addWidget(self.explore_cb)
+        tb.insertWidget(tb.count() - 1, self.explore_cb)
 
         # Actions
-        avalanche_btn = QPushButton("⚡ Avalanche")
-        avalanche_btn.setStyleSheet(f"""
-            QPushButton {{
-                background: {Colors.BG_OVERLAY}; color: {Colors.ACCENT};
-                border: 1px solid {Colors.ACCENT}; border-radius: 4px;
-                padding: 4px 10px; font-weight: 600;
-            }}
-            QPushButton:hover {{ background: {Colors.ACCENT}; color: {Colors.BG}; }}
-        """)
-        avalanche_btn.clicked.connect(self._on_avalanche)
-        tb.addWidget(avalanche_btn)
+        avalanche_btn = make_button("⚡ Avalanche", outlined=True,
+                                    callback=self._on_avalanche)
+        tb.insertWidget(tb.count() - 1, avalanche_btn)
 
         relax_btn = QPushButton("Relax")
         relax_btn.clicked.connect(self._on_relax)
-        tb.addWidget(relax_btn)
+        tb.insertWidget(tb.count() - 1, relax_btn)
 
-        tb_w = QWidget()
-        tb_w.setLayout(tb)
-        tb_w.setStyleSheet(
-            f"background-color: {Colors.BG_RAISED}; border-bottom: 1px solid {Colors.BORDER};"
-            + f"QCheckBox {{ color: {Colors.TEXT}; font-size: 11px; }}"
-            + f"QLabel {{ color: {Colors.TEXT_DIM}; font-size: 11px; }}"
-            + f"QPushButton {{ background: {Colors.BG_OVERLAY}; color: {Colors.TEXT}; border: 1px solid {Colors.BORDER}; border-radius: 4px; padding: 4px 10px; }}"
-            + f"QPushButton:hover {{ background: {Colors.BG_HOVER}; }}"
-        )
+        export_btn = QPushButton("📷 Export PNG")
+        export_btn.clicked.connect(self._on_export)
+        tb.insertWidget(tb.count() - 1, export_btn)
+
         layout.addWidget(tb_w)
 
         # Canvas
@@ -1147,11 +1625,9 @@ class EBMView(QWidget):
         layout.addWidget(self.canvas, stretch=1)
 
         # Info bar
-        self.info_bar = QLabel("Hover splats to inspect · Double-click to select · ⚡ Avalanche to cascade")
-        self.info_bar.setStyleSheet(f"""
-            color: {Colors.TEXT_DIM}; font-size: 11px; padding: 6px 12px;
-            background-color: {Colors.BG_RAISED}; border-top: 1px solid {Colors.BORDER};
-        """)
+        self.info_bar = build_info_bar(
+            "Hover splats to inspect · Double-click to select · ⚡ Avalanche to cascade"
+        )
         layout.addWidget(self.info_bar)
 
         self.setStyleSheet(f"background-color: {Colors.BG};")
@@ -1181,3 +1657,11 @@ class EBMView(QWidget):
         self.canvas.relax_system()
         fe = self.canvas._engine.free_energy()
         self.info_bar.setText(f"System relaxed · Free energy F={fe:.3f}")
+
+    def _on_export(self):
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Export Heatmap as PNG", "ebm_heatmap.png", "PNG Images (*.png)"
+        )
+        if path:
+            self.canvas.export_heatmap_png(path)
+            self.info_bar.setText(f"Heatmap exported to {path}")

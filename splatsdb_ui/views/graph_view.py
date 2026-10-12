@@ -13,7 +13,9 @@ Mathematical foundations:
     where offset = f(angle_diff, edge_weight)
 
   Node sizing:  radius ∝ degree^0.5  (square-root scaling)
-  Edge width:   proportional to weight^0.7
+  Edge width:   proportional to weight^0.5 (thin for weak, thick for strong)
+  Edge color:   source node category color (75/25 blend toward target)
+  Edge labels:  hover-only tooltip showing relation type, weight, and score
 
 Visual style — "Celestial Network":
   Deep space vignette background, golden-ratio palette node halos,
@@ -29,12 +31,15 @@ from collections import defaultdict
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
     QComboBox, QSlider, QSplitter, QSizePolicy, QCheckBox,
+    QMenu, QLineEdit, QToolTip,
 )
-from PySide6.QtCore import Signal, Qt, QTimer, QPointF
+from PySide6.QtCore import Signal, Qt, QTimer, QPointF, QPropertyAnimation, QEasingCurve
 from PySide6.QtGui import (
     QPainter, QColor, QPen, QBrush, QFont,
-    QPainterPath, QRadialGradient,
+    QPainterPath, QRadialGradient, QLinearGradient,
+    QAction, QTextOption,
 )
+from PySide6.QtCore import QRectF, Property
 
 from splatsdb_ui.utils.theme import Colors
 from splatsdb_ui.utils.icons import icon
@@ -42,7 +47,7 @@ from splatsdb_ui.utils.icons import icon
 PHI = (1 + math.sqrt(5)) / 2  # Golden ratio ≈ 1.618
 
 # ---------------------------------------------------------------------------
-# Golden-ratio palette
+# Golden-ratio palette — used as fallback / category colors
 # ---------------------------------------------------------------------------
 
 _PALETTE = [
@@ -59,20 +64,17 @@ _PALETTE = [
 ]
 
 
+def _palette_color(idx: int) -> QColor:
+    """Return a QColor from the fixed palette (wraps around)."""
+    r, g, b = _PALETTE[idx % len(_PALETTE)]
+    return QColor(r, g, b)
+
+
 def _node_color(idx: int) -> QColor:
     """Generate color via golden-ratio hue spacing."""
     hue = (idx * (1.0 / PHI)) % 1.0
     r, g, b = colorsys.hsv_to_rgb(hue, 0.65, 0.88)
     return QColor(int(r * 255), int(g * 255), int(b * 255))
-
-
-def _lerp_color(c1: QColor, c2: QColor, t: float) -> QColor:
-    """Linear interpolation between two colors."""
-    return QColor(
-        int(c1.red() + (c2.red() - c1.red()) * t),
-        int(c1.green() + (c2.green() - c1.green()) * t),
-        int(c1.blue() + (c2.blue() - c1.blue()) * t),
-    )
 
 
 # ---------------------------------------------------------------------------
@@ -83,7 +85,7 @@ class GraphNode:
     """A single node in the force-directed graph."""
     __slots__ = ('id', 'label', 'category', 'x', 'y', 'vx', 'vy',
                  'fx', 'fy', 'degree', 'radius', 'color', 'connections',
-                 'mass', 'phase', 'original_idx')
+                 'mass', 'phase', 'original_idx', 'pinned', 'hidden')
 
     def __init__(self, nid: str, label: str, category: str = "",
                  color_idx: int = 0, original_idx: int = 0):
@@ -103,21 +105,24 @@ class GraphNode:
         self.mass = 1.0
         self.phase = 0.0  # animation phase offset
         self.original_idx = original_idx
+        self.pinned = False  # if True, position is locked
+        self.hidden = False  # if True, node is not rendered
 
 
 class GraphEdge:
     """An edge between two graph nodes."""
     __slots__ = ('source_idx', 'target_idx', 'weight', 'score',
-                 'ctrl_x', 'ctrl_y')
+                 'ctrl_x', 'ctrl_y', 'relation_type')
 
     def __init__(self, src: int, tgt: int, weight: float = 1.0,
-                 score: float = 0.0):
+                 score: float = 0.0, relation_type: str = ""):
         self.source_idx = src
         self.target_idx = tgt
         self.weight = weight
         self.score = score
         self.ctrl_x = 0.0  # Bézier control point x
         self.ctrl_y = 0.0  # Bézier control point y
+        self.relation_type = relation_type
 
 
 # ---------------------------------------------------------------------------
@@ -186,8 +191,9 @@ class ForceLayoutEngine:
                 score = conn.get("score", 0.5)
                 distance = conn.get("distance", 1.0)
                 weight = score * max(1.0 - distance, 0.1)
+                relation_type = conn.get("relation", conn.get("type", ""))
 
-                edge = GraphEdge(i, j, weight, score)
+                edge = GraphEdge(i, j, weight, score, relation_type)
                 self.edges.append(edge)
 
                 # Update degree
@@ -323,6 +329,12 @@ class ForceLayoutEngine:
         # --- Apply forces with damping ---
         max_displacement = 0
         for node in self.nodes:
+            # Pinned nodes don't move
+            if node.pinned:
+                node.vx = 0.0
+                node.vy = 0.0
+                continue
+
             # v(t+1) = 0.85 · v(t) + F(t)/m
             node.vx = self.damping * node.vx + node.fx / node.mass
             node.vy = self.damping * node.vy + node.fy / node.mass
@@ -430,21 +442,57 @@ class GraphCanvas(QWidget):
 
     node_clicked = Signal(str)   # emits node id
     node_hovered = Signal(str)   # emits node id
+    node_navigate = Signal(str)  # emits node id — navigate to this node
+    node_inspect = Signal(str)   # emits node id — inspect details
 
     def __init__(self):
         super().__init__()
         self.setMinimumSize(600, 400)
         self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         self.setMouseTracking(True)
+        self.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.customContextMenuRequested.connect(self._show_context_menu)
 
         self.engine = ForceLayoutEngine()
         self._hovered_node: int = -1
         self._selected_node: int = -1
+        self._hovered_edge: int = -1
         self._animating = True
         self._show_bundling = True
+        self._show_edge_labels = True
         self._anim_time = 0.0
 
-        # Animation timer for gentle floating
+        # Search / filter state
+        self._search_text: str = ""
+        self._search_matches: set[int] = set()
+
+        # Right-click context menu position tracking
+        self._context_menu_node: int = -1
+
+        # --- Zoom / Pan with smooth animation + momentum ---
+        self._zoom = 1.0
+        self._target_zoom = 1.0
+        self._pan_x = 0.0
+        self._pan_y = 0.0
+        self._target_pan_x = 0.0
+        self._target_pan_y = 0.0
+        self._panning = False
+        self._pan_start_x = 0.0
+        self._pan_start_y = 0.0
+        self._pan_start_offset_x = 0.0
+        self._pan_start_offset_y = 0.0
+        # Momentum (inertia) for pan
+        self._vel_x = 0.0
+        self._vel_y = 0.0
+        self._last_pan_x = 0.0
+        self._last_pan_y = 0.0
+        self._momentum_active = False
+
+        # Viewport culling cache
+        self._visible_node_indices: list[int] = []
+        self._visible_edge_indices: list[int] = []
+
+        # Animation timer for gentle floating + smooth zoom/pan
         self._timer = QTimer(self)
         self._timer.timeout.connect(self._tick)
         self._timer.start(33)  # ~30 FPS
@@ -467,6 +515,7 @@ class GraphCanvas(QWidget):
 
         self._hovered_node = -1
         self._selected_node = -1
+        self._hovered_edge = -1
         self.update()
 
     def set_physics(self, kr: float, ka: float, kg: float):
@@ -499,30 +548,318 @@ class GraphCanvas(QWidget):
         self.engine.compute_edge_bundling()
         self.update()
 
+    def set_search_filter(self, text: str):
+        """Set search text; nodes matching by label/id/category are highlighted."""
+        self._search_text = text.strip().lower()
+        self._search_matches.clear()
+        if self._search_text:
+            for i, node in enumerate(self.engine.nodes):
+                if (self._search_text in node.label.lower() or
+                        self._search_text in node.id.lower() or
+                        self._search_text in node.category.lower()):
+                    self._search_matches.add(i)
+        self.update()
+
+    def set_edge_labels(self, on: bool):
+        self._show_edge_labels = on
+        self.update()
+
+    def _find_edge_at(self, pos_x: float, pos_y: float) -> int:
+        """Find the edge index closest to the given canvas position, or -1.
+
+        Uses point-to-quadratic-Bézier distance with adaptive sampling.
+        """
+        nodes = self.engine.nodes
+        best_ei = -1
+        best_d = float('inf')
+        hit_threshold = 8.0  # pixels
+
+        for ei, edge in enumerate(self.engine.edges):
+            if edge.source_idx >= len(nodes) or edge.target_idx >= len(nodes):
+                continue
+            ni = nodes[edge.source_idx]
+            nj = nodes[edge.target_idx]
+            if ni.hidden or nj.hidden:
+                continue
+
+            ax, ay = self._animated_pos(ni)
+            bx, by = self._animated_pos(nj)
+
+            # Control point
+            if self._show_bundling:
+                cx = edge.ctrl_x
+                cy = edge.ctrl_y
+                t_off = math.sin(self._anim_time * 0.5 + edge.weight * 10) * 2
+                cx += t_off
+                cy += t_off
+            else:
+                cx = (ax + bx) / 2
+                cy = (ay + by) / 2
+
+            # Sample points along Bézier and check distance
+            n_samples = 16
+            for s in range(n_samples + 1):
+                t = s / n_samples
+                inv = 1.0 - t
+                px = inv * inv * ax + 2 * inv * t * cx + t * t * bx
+                py = inv * inv * ay + 2 * inv * t * cy + t * t * by
+                dx = pos_x - px
+                dy = pos_y - py
+                d = math.sqrt(dx * dx + dy * dy)
+                if d < best_d:
+                    best_d = d
+                    best_ei = ei
+
+        if best_d <= hit_threshold:
+            return best_ei
+        return -1
+
+    def _find_node_at(self, pos_x: float, pos_y: float) -> int:
+        """Find the node index at the given canvas position, or -1."""
+        nodes = self.engine.nodes
+        closest = -1
+        min_d = float('inf')
+        for i, node in enumerate(nodes):
+            if node.hidden:
+                continue
+            ax, ay = self._animated_pos(node)
+            dx = pos_x - ax
+            dy = pos_y - ay
+            d = math.sqrt(dx * dx + dy * dy)
+            hit_r = node.radius + 8
+            if d < hit_r and d < min_d:
+                min_d = d
+                closest = i
+        return closest
+
+    def _show_context_menu(self, pos):
+        """Show right-click context menu on a node."""
+        idx = self._find_node_at(pos.x(), pos.y())
+        if idx < 0:
+            return
+
+        self._context_menu_node = idx
+        node = self.engine.nodes[idx]
+        menu = QMenu(self)
+        menu.setStyleSheet(f"""
+            QMenu {{
+                background-color: {Colors.BG_RAISED};
+                color: {Colors.TEXT};
+                border: 1px solid {Colors.BORDER};
+                border-radius: 6px;
+                padding: 4px;
+            }}
+            QMenu::item {{
+                padding: 6px 24px;
+                border-radius: 4px;
+            }}
+            QMenu::item:selected {{
+                background-color: {Colors.ACCENT};
+                color: {Colors.BG};
+            }}
+            QMenu::separator {{
+                height: 1px;
+                background: {Colors.BORDER};
+                margin: 4px 8px;
+            }}
+        """)
+
+        # Navigate
+        act_navigate = menu.addAction("🔗  Navigate")
+        act_navigate.triggered.connect(self._ctx_navigate)
+
+        # Inspect
+        act_inspect = menu.addAction("🔍  Inspect")
+        act_inspect.triggered.connect(self._ctx_inspect)
+
+        menu.addSeparator()
+
+        # Color by group — recolor all nodes sharing this node's category
+        act_color = menu.addAction("🎨  Color by Group")
+        act_color.triggered.connect(self._ctx_color_by_group)
+
+        menu.addSeparator()
+
+        # Hide
+        act_hide = menu.addAction("👁‍🗨  Hide Node")
+        act_hide.triggered.connect(self._ctx_hide)
+
+        # Pin / Unpin
+        if node.pinned:
+            act_pin = menu.addAction("📌  Unpin Node")
+        else:
+            act_pin = menu.addAction("📌  Pin Node")
+        act_pin.triggered.connect(self._ctx_toggle_pin)
+
+        menu.exec(self.mapToGlobal(pos))
+
+    def _ctx_navigate(self):
+        idx = self._context_menu_node
+        if 0 <= idx < len(self.engine.nodes):
+            self.node_navigate.emit(self.engine.nodes[idx].id)
+            self._selected_node = idx
+            self.update()
+
+    def _ctx_inspect(self):
+        idx = self._context_menu_node
+        if 0 <= idx < len(self.engine.nodes):
+            self.node_inspect.emit(self.engine.nodes[idx].id)
+
+    def _ctx_color_by_group(self):
+        """Recolor all nodes that share the same category as the context node."""
+        idx = self._context_menu_node
+        if idx < 0 or idx >= len(self.engine.nodes):
+            return
+        target_cat = self.engine.nodes[idx].category
+        if not target_cat:
+            return
+        # Pick a distinct color for this category
+        cat_indices = [i for i, n in enumerate(self.engine.nodes)
+                       if n.category == target_cat]
+        base_color = _palette_color(hash(target_cat) % len(_PALETTE))
+        for i in cat_indices:
+            self.engine.nodes[i].color = QColor(base_color)
+        self.update()
+
+    def _ctx_hide(self):
+        idx = self._context_menu_node
+        if 0 <= idx < len(self.engine.nodes):
+            self.engine.nodes[idx].hidden = True
+            if self._selected_node == idx:
+                self._selected_node = -1
+            if self._hovered_node == idx:
+                self._hovered_node = -1
+            self.update()
+
+    def _ctx_toggle_pin(self):
+        idx = self._context_menu_node
+        if 0 <= idx < len(self.engine.nodes):
+            node = self.engine.nodes[idx]
+            node.pinned = not node.pinned
+            # Zero velocity when pinning
+            if node.pinned:
+                node.vx = 0.0
+                node.vy = 0.0
+
     def _tick(self):
-        """Animation tick — gentle floating oscillation."""
+        """Animation tick — gentle floating oscillation + smooth zoom/pan."""
         if self._animating and self.engine.nodes:
             self._anim_time += 0.033
-            self.update()
+
+        # Smooth zoom interpolation (exponential ease)
+        zoom_diff = self._target_zoom - self._zoom
+        if abs(zoom_diff) > 0.002:
+            self._zoom += zoom_diff * 0.18
+        else:
+            self._zoom = self._target_zoom
+
+        # Smooth pan interpolation with momentum
+        if self._momentum_active and not self._panning:
+            self._vel_x *= 0.92  # Friction
+            self._vel_y *= 0.92
+            self._target_pan_x += self._vel_x
+            self._target_pan_y += self._vel_y
+            if abs(self._vel_x) < 0.1 and abs(self._vel_y) < 0.1:
+                self._momentum_active = False
+
+        pan_dx = self._target_pan_x - self._pan_x
+        pan_dy = self._target_pan_y - self._pan_y
+        if abs(pan_dx) > 0.5 or abs(pan_dy) > 0.5:
+            self._pan_x += pan_dx * 0.2
+            self._pan_y += pan_dy * 0.2
+        else:
+            self._pan_x = self._target_pan_x
+            self._pan_y = self._target_pan_y
+
+        self.update()
 
     # --- Rendering ---
 
     def paintEvent(self, event):
         painter = QPainter(self)
         painter.setRenderHint(QPainter.Antialiasing)
+        painter.setRenderHint(QPainter.SmoothPixmapTransform)
         w, h = self.width(), self.height()
 
         self._paint_background(painter, w, h)
+
+        # Apply zoom / pan transform for all graph content
+        painter.save()
+        painter.translate(w / 2.0 + self._pan_x, h / 2.0 + self._pan_y)
+        painter.scale(self._zoom, self._zoom)
+        painter.translate(-w / 2.0, -h / 2.0)
+
+        # Viewport culling: compute visible bounds in layout coordinates
+        self._compute_visible_set(w, h)
+
         self._paint_edges(painter)
+        self._paint_edge_particles(painter)
+        self._paint_hovered_edge_label(painter)
         self._paint_nodes(painter, w, h)
+
+        painter.restore()
+
+        # Minimap and info are drawn in screen coordinates (unzoomed)
+        self._paint_minimap(painter, w, h)
         self._paint_info(painter, w, h)
 
         painter.end()
 
+    def _compute_visible_set(self, w: int, h: int):
+        """Compute which nodes/edges are visible in the current viewport."""
+        inv_zoom = 1.0 / max(self._zoom, 0.01)
+        margin = 60  # extra margin for node radius + glow
+        # Visible rect in layout coordinates
+        vx_min = (0 - w / 2.0 - self._pan_x) * inv_zoom + w / 2.0 - margin
+        vy_min = (0 - h / 2.0 - self._pan_y) * inv_zoom + h / 2.0 - margin
+        vx_max = (w - w / 2.0 - self._pan_x) * inv_zoom + w / 2.0 + margin
+        vy_max = (h - h / 2.0 - self._pan_y) * inv_zoom + h / 2.0 + margin
+
+        self._visible_node_indices = []
+        for i, node in enumerate(self.engine.nodes):
+            if node.hidden:
+                continue
+            ax, ay = self._animated_pos(node)
+            r = node.radius
+            if (ax - r < vx_max and ax + r > vx_min and
+                    ay - r < vy_max and ay + r > vy_min):
+                self._visible_node_indices.append(i)
+
+        visible_set = set(self._visible_node_indices)
+        self._visible_edge_indices = []
+        for ei, edge in enumerate(self.engine.edges):
+            if (edge.source_idx in visible_set or
+                    edge.target_idx in visible_set):
+                self._visible_edge_indices.append(ei)
+
     def _paint_background(self, painter: QPainter, w: int, h: int):
-        """Deep space background with radial vignette."""
+        """Deep space background with nebula clouds, twinkling stars, and grid."""
+        import random
+
         # Base fill
         painter.fillRect(0, 0, w, h, QColor(Colors.BG))
+
+        # --- Nebula clouds (large semi-transparent radial gradients) ---
+        painter.setPen(Qt.NoPen)
+        nebula_specs = [
+            # (seed, cx_ratio, cy_ratio, r_ratio, r, g, b, peak_alpha)
+            (101, 0.20, 0.30, 0.35, 80, 40, 120, 18),   # Deep purple (upper-left)
+            (102, 0.75, 0.25, 0.30, 20, 80, 100, 14),   # Teal (upper-right)
+            (103, 0.50, 0.70, 0.40, 120, 40, 80, 16),   # Magenta (lower-center)
+            (104, 0.85, 0.75, 0.25, 40, 60, 100, 12),   # Indigo (lower-right)
+            (105, 0.15, 0.80, 0.28, 20, 100, 80, 10),   # Sea-green (lower-left)
+        ]
+        for _seed, cx_r, cy_r, rr, nr, ng, nb, peak_a in nebula_specs:
+            cx = w * cx_r
+            cy = h * cy_r
+            radius = max(w, h) * rr
+            neb = QRadialGradient(cx, cy, radius)
+            neb.setColorAt(0.0, QColor(nr, ng, nb, peak_a))
+            neb.setColorAt(0.4, QColor(nr, ng, nb, peak_a // 2))
+            neb.setColorAt(0.7, QColor(nr, ng, nb, peak_a // 4))
+            neb.setColorAt(1.0, QColor(nr, ng, nb, 0))
+            painter.setBrush(QBrush(neb))
+            painter.drawEllipse(QPointF(cx, cy), radius, radius)
 
         # Radial vignette — darker at edges
         vignette = QRadialGradient(w / 2, h / 2, max(w, h) * 0.7)
@@ -531,26 +868,59 @@ class GraphCanvas(QWidget):
         vignette.setColorAt(1.0, QColor(0, 0, 0, 120))
         painter.fillRect(0, 0, w, h, vignette)
 
-        # Subtle star-like dots
-        import random
+        # --- Twinkling star-like dots ---
         rng = random.Random(42)  # Deterministic stars
         painter.setPen(Qt.NoPen)
-        for _ in range(80):
-            sx = rng.randint(0, w)
-            sy = rng.randint(0, h)
-            alpha = rng.randint(8, 30)
-            painter.setBrush(QBrush(QColor(255, 255, 255, alpha)))
-            painter.drawEllipse(sx, sy, 1, 1)
+        t = self._anim_time
+        for _ in range(120):
+            sx = rng.randint(0, max(w, 1))
+            sy = rng.randint(0, max(h, 1))
+            base_alpha = rng.randint(8, 35)
+            # Each star gets a unique twinkle phase and speed
+            phase = rng.uniform(0, 2 * math.pi)
+            speed = rng.uniform(0.5, 2.5)
+            # Sinusoidal twinkle: oscillate alpha ±50% around base
+            twinkle = math.sin(t * speed + phase)
+            alpha = int(base_alpha * (1.0 + 0.5 * twinkle))
+            alpha = max(2, min(70, alpha))
+            # Vary size: brighter stars are slightly larger
+            size = 1 if base_alpha < 20 else (2 if rng.random() < 0.3 else 1)
+            # Slight color tint for some stars
+            if rng.random() < 0.15:
+                # Warm-tinted star
+                star_color = QColor(255, 220, 180, alpha)
+            elif rng.random() < 0.15:
+                # Cool-tinted star
+                star_color = QColor(180, 200, 255, alpha)
+            else:
+                star_color = QColor(255, 255, 255, alpha)
+            painter.setBrush(QBrush(star_color))
+            painter.drawEllipse(sx, sy, size, size)
 
-        # Fine grid (very subtle)
-        painter.setPen(QPen(QColor(255, 255, 255, 5), 0.5))
-        for x in range(0, w, 40):
+        # --- Subtle two-level grid overlay ---
+        # Minor grid lines (very faint)
+        minor_pen = QPen(QColor(255, 255, 255, 6), 0.5)
+        painter.setPen(minor_pen)
+        grid_minor = 40
+        for x in range(0, w, grid_minor):
             painter.drawLine(x, 0, x, h)
-        for y in range(0, h, 40):
+        for y in range(0, h, grid_minor):
+            painter.drawLine(0, y, w, y)
+
+        # Major grid lines (slightly more visible, every 4th minor)
+        major_pen = QPen(QColor(255, 255, 255, 12), 0.5)
+        painter.setPen(major_pen)
+        grid_major = grid_minor * 4
+        for x in range(0, w, grid_major):
+            painter.drawLine(x, 0, x, h)
+        for y in range(0, h, grid_major):
             painter.drawLine(0, y, w, y)
 
     def _paint_edges(self, painter: QPainter):
-        """Draw edges as quadratic Bézier curves with alpha gradients."""
+        """Draw edges as quadratic Bézier curves with alpha gradients.
+
+        Only draws edges in the visible set (viewport culling).
+        """
         nodes = self.engine.nodes
         if not nodes:
             return
@@ -562,16 +932,32 @@ class GraphCanvas(QWidget):
         highlight_set: set[int] = set()
         if hovered >= 0 or selected >= 0:
             active = hovered if hovered >= 0 else selected
-            for ei, edge in enumerate(self.engine.edges):
+            for ei in self._visible_edge_indices:
+                edge = self.engine.edges[ei]
                 if edge.source_idx == active or edge.target_idx == active:
                     highlight_set.add(ei)
 
-        for ei, edge in enumerate(self.engine.edges):
+        # Also ensure hovered edge is in the set even if outside culling
+        if self._hovered_edge >= 0:
+            highlight_set.add(self._hovered_edge)
+
+        visible_edge_set = set(self._visible_edge_indices)
+        # Always include highlighted edges
+        draw_set = visible_edge_set | highlight_set
+
+        for ei in draw_set:
+            if ei >= len(self.engine.edges):
+                continue
+            edge = self.engine.edges[ei]
             if edge.source_idx >= len(nodes) or edge.target_idx >= len(nodes):
                 continue
 
             ni = nodes[edge.source_idx]
             nj = nodes[edge.target_idx]
+
+            # Skip edges involving hidden nodes
+            if ni.hidden or nj.hidden:
+                continue
 
             is_highlighted = ei in highlight_set
             is_dim = (hovered >= 0 or selected >= 0) and not is_highlighted
@@ -592,23 +978,26 @@ class GraphCanvas(QWidget):
                 cx = (ax + bx) / 2
                 cy = (ay + by) / 2
 
-            # Edge width: proportional to weight^0.7
-            base_width = 1.0 + edge.weight ** 0.7 * 3.0
+            # Edge width: proportional to weight — thin for weak, thick for strong
+            # weight^0.5 gives more visible contrast: 0.1→1.3px, 0.5→2.7px, 1.0→4.0px
+            base_width = 0.8 + edge.weight ** 0.5 * 3.2
             if is_highlighted:
                 base_width *= 1.5
+            # Hovered edge gets extra emphasis
+            if ei == self._hovered_edge:
+                base_width *= 1.3
 
-            # Color: blend of source and target node colors
-            blend = _lerp_color(ni.color, nj.color, 0.5)
+            # Color: source node category color (75%) blended toward target (25%)
+            edge_color = Colors.lerp_color(nj.color, ni.color, 0.75)
 
             if is_dim:
                 alpha = 15
-            elif is_highlighted:
+            elif is_highlighted or ei == self._hovered_edge:
                 alpha = int(80 + edge.weight * 140)
             else:
                 alpha = int(25 + edge.weight * 60)
 
             # Draw with alpha gradient (stronger at endpoints, lighter at mid)
-            # Use QLinearGradient along the edge for the alpha fade
             # Since Bézier curves can't directly use gradients along path,
             # we draw multiple segments with varying alpha
             n_seg = 12
@@ -624,21 +1013,205 @@ class GraphCanvas(QWidget):
                 alpha_t = 1.0 - 0.5 * (1.0 - abs(2 * t - 1))
                 seg_alpha = int(alpha * alpha_t)
 
-                pen_color = QColor(blend)
-                pen_color.setAlpha(max(5, seg_alpha))
+                pen_color = Colors.with_alpha(edge_color, max(5, seg_alpha))
                 painter.setPen(QPen(pen_color, base_width * alpha_t,
                                     Qt.SolidLine, Qt.RoundCap))
                 painter.drawLine(QPointF(prev_x, prev_y), QPointF(px, py))
                 prev_x, prev_y = px, py
 
+    def _paint_edge_particles(self, painter: QPainter):
+        """Draw animated particles flowing along edges (source → target).
+
+        Only draws particles for edges in the visible set (viewport culling).
+        """
+        nodes = self.engine.nodes
+        if not nodes or not self._animating:
+            return
+
+        hovered = self._hovered_node
+        selected = self._selected_node
+
+        # Only show particles on highlighted edges (or all if none selected)
+        has_selection = hovered >= 0 or selected >= 0
+        active = hovered if hovered >= 0 else selected
+
+        t = self._anim_time
+
+        visible_set = set(self._visible_edge_indices)
+
+        for ei in visible_set:
+            edge = self.engine.edges[ei]
+            if edge.source_idx >= len(nodes) or edge.target_idx >= len(nodes):
+                continue
+
+            # If a node is selected, only show particles on connected edges
+            if has_selection:
+                if edge.source_idx != active and edge.target_idx != active:
+                    continue
+                particle_count = 4
+                particle_alpha = 160
+            else:
+                particle_count = 2
+                particle_alpha = 70
+
+            ni = nodes[edge.source_idx]
+            nj = nodes[edge.target_idx]
+
+            # Skip particles for hidden nodes
+            if ni.hidden or nj.hidden:
+                continue
+
+            ax, ay = self._animated_pos(ni)
+            bx, by = self._animated_pos(nj)
+
+            # Control point (same as edge drawing)
+            if self._show_bundling:
+                cx = edge.ctrl_x
+                cy = edge.ctrl_y
+                t_off = math.sin(t * 0.5 + edge.weight * 10) * 2
+                cx += t_off
+                cy += t_off
+            else:
+                cx = (ax + bx) / 2
+                cy = (ay + by) / 2
+
+            # Edge color (same logic as _paint_edges: source category dominant)
+            edge_color = Colors.lerp_color(nj.color, ni.color, 0.75)
+
+            for p in range(particle_count):
+                # Each particle has a unique phase offset so they're staggered
+                phase = (p / particle_count)
+                # Animate: particles flow from t=0 (source) to t=1 (target)
+                progress = (t * 0.4 + phase + ei * 0.07) % 1.0
+
+                # Quadratic Bézier position at this progress
+                inv = 1.0 - progress
+                px = inv * inv * ax + 2 * inv * progress * cx + progress * progress * bx
+                py = inv * inv * ay + 2 * inv * progress * cy + progress * progress * by
+
+                # Particle size: small dot, slightly larger near middle
+                size_factor = 1.0 - abs(2.0 * progress - 1.0)  # peak at 0.5
+                dot_r = 1.5 + size_factor * 1.5
+
+                # Alpha: fade in at start, fade out at end
+                fade = min(progress * 4.0, (1.0 - progress) * 4.0, 1.0)
+                alpha = int(particle_alpha * fade)
+
+                # Draw particle with a tiny glow
+                glow_r = dot_r * 3.0
+                glow = QRadialGradient(px, py, glow_r)
+                glow.setColorAt(0.0, Colors.with_alpha(edge_color, alpha))
+                glow.setColorAt(0.4, Colors.with_alpha(edge_color, alpha // 3))
+                glow.setColorAt(1.0, Colors.with_alpha(edge_color, 0))
+
+                painter.setPen(Qt.NoPen)
+                painter.setBrush(QBrush(glow))
+                painter.drawEllipse(QPointF(px, py), glow_r, glow_r)
+
+                # Bright core dot
+                painter.setBrush(QBrush(
+                    Colors.with_alpha(QColor(255, 255, 255), alpha // 2)))
+                painter.drawEllipse(QPointF(px, py), dot_r, dot_r)
+
+    def _paint_hovered_edge_label(self, painter: QPainter):
+        """Draw a label tooltip for the currently hovered edge only."""
+        if self._hovered_edge < 0 or not self._show_edge_labels:
+            return
+
+        nodes = self.engine.nodes
+        ei = self._hovered_edge
+        if ei >= len(self.engine.edges):
+            return
+
+        edge = self.engine.edges[ei]
+        if edge.source_idx >= len(nodes) or edge.target_idx >= len(nodes):
+            return
+
+        ni = nodes[edge.source_idx]
+        nj = nodes[edge.target_idx]
+        if ni.hidden or nj.hidden:
+            return
+
+        ax, ay = self._animated_pos(ni)
+        bx, by = self._animated_pos(nj)
+
+        # Control point
+        if self._show_bundling:
+            cx = edge.ctrl_x
+            cy = edge.ctrl_y
+            t_off = math.sin(self._anim_time * 0.5 + edge.weight * 10) * 2
+            cx += t_off
+            cy += t_off
+        else:
+            cx = (ax + bx) / 2
+            cy = (ay + by) / 2
+
+        # Label position: at t=0.5 on the Bézier (midpoint)
+        mid_x = 0.25 * ax + 0.5 * cx + 0.25 * bx
+        mid_y = 0.25 * ay + 0.5 * cy + 0.25 * by
+
+        # Build label text
+        label_parts = []
+        if edge.relation_type:
+            label_parts.append(edge.relation_type)
+        label_parts.append(f"w: {edge.weight:.2f}")
+        label_parts.append(f"s: {edge.score:.2f}")
+        label_text = "  |  ".join(label_parts)
+
+        # Measure text
+        font_size = 10
+        painter.setFont(QFont("sans-serif", font_size, QFont.Medium))
+        fm = painter.fontMetrics()
+        tw = fm.horizontalAdvance(label_text)
+        th = fm.height()
+
+        # Background pill
+        pad_x, pad_y = 8, 4
+        pill_w = tw + pad_x * 2
+        pill_h = th + pad_y * 2
+        pill_x = mid_x - pill_w / 2
+        pill_y = mid_y - pill_h - 6  # offset above the edge
+
+        # Draw pill background with rounded rect
+        edge_color = Colors.lerp_color(nj.color, ni.color, 0.75)
+        bg_color = Colors.with_alpha(QColor(Colors.BG_RAISED), 220)
+        painter.setPen(Qt.NoPen)
+        painter.setBrush(QBrush(bg_color))
+        painter.drawRoundedRect(QRectF(pill_x, pill_y, pill_w, pill_h), 5, 5)
+
+        # Draw pill border using the edge's source-category color
+        border_color = Colors.with_alpha(edge_color, 180)
+        painter.setPen(QPen(border_color, 1.0))
+        painter.setBrush(Qt.NoBrush)
+        painter.drawRoundedRect(QRectF(pill_x, pill_y, pill_w, pill_h), 5, 5)
+
+        # Draw colored accent dot before text
+        dot_r = 3.0
+        dot_x = pill_x + pad_x + dot_r
+        dot_y = pill_y + pill_h / 2
+        painter.setPen(Qt.NoPen)
+        painter.setBrush(QBrush(edge_color))
+        painter.drawEllipse(QPointF(dot_x, dot_y), dot_r, dot_r)
+
+        # Draw text
+        text_color = QColor(Colors.TEXT)
+        painter.setPen(QPen(text_color))
+        text_x = pill_x + pad_x + dot_r * 2 + 4
+        text_y = pill_y + pad_y + fm.ascent()
+        painter.drawText(int(text_x), int(text_y), label_text)
+
     def _paint_nodes(self, painter: QPainter, w: int, h: int):
-        """Draw nodes with concentric ring halos and glow."""
+        """Draw nodes with concentric ring halos and glow.
+
+        Only draws nodes in the visible set (viewport culling).
+        """
         nodes = self.engine.nodes
         if not nodes:
             return
 
         hovered = self._hovered_node
         selected = self._selected_node
+        has_search = len(self._search_matches) > 0 or self._search_text
 
         # Determine neighbor set for hover glow
         neighbor_set: set[int] = set()
@@ -649,14 +1222,53 @@ class GraphCanvas(QWidget):
                 elif edge.target_idx == hovered:
                     neighbor_set.add(edge.source_idx)
 
-        for i, node in enumerate(nodes):
+        # Always ensure hovered/selected nodes are drawn
+        always_draw = {hovered, selected} - {-1}
+        visible_set = set(self._visible_node_indices) | always_draw
+
+        for i in visible_set:
+            if i < 0 or i >= len(nodes):
+                continue
+            node = nodes[i]
+            # Skip hidden nodes entirely
+            if node.hidden:
+                continue
+
             ax, ay = self._animated_pos(node)
 
             is_hovered = i == hovered
             is_selected = i == selected
             is_neighbor = i in neighbor_set
+            is_search_match = i in self._search_matches
+
+            # Dim nodes that don't match the active search filter
+            if has_search and not is_search_match:
+                # Draw a dim ghost of the node
+                r = node.radius
+                dim_color = Colors.with_alpha(QColor(node.color), 25)
+                painter.setPen(Qt.NoPen)
+                painter.setBrush(QBrush(dim_color))
+                painter.drawEllipse(QPointF(ax, ay), r, r)
+                # Skip label for dimmed nodes
+                continue
 
             r = node.radius
+
+            # --- Drop shadow (offset ellipse for depth) ---
+            shadow_offset_x = r * 0.18
+            shadow_offset_y = r * 0.25
+            shadow_r = r * 1.35
+            shadow_grad = QRadialGradient(
+                ax + shadow_offset_x, ay + shadow_offset_y, shadow_r)
+            shadow_alpha = 60 if (is_hovered or is_selected) else 35
+            shadow_grad.setColorAt(0.0, QColor(0, 0, 0, shadow_alpha))
+            shadow_grad.setColorAt(0.5, QColor(0, 0, 0, shadow_alpha // 3))
+            shadow_grad.setColorAt(1.0, QColor(0, 0, 0, 0))
+            painter.setPen(Qt.NoPen)
+            painter.setBrush(QBrush(shadow_grad))
+            painter.drawEllipse(
+                QPointF(ax + shadow_offset_x, ay + shadow_offset_y),
+                shadow_r, shadow_r)
 
             # --- Outer glow (QRadialGradient) ---
             glow_radius = r * (3.0 if is_hovered or is_selected else
@@ -665,8 +1277,11 @@ class GraphCanvas(QWidget):
 
             base_color = QColor(node.color)
             if is_hovered or is_selected:
-                glow_alpha_inner = 100
-                glow_alpha_mid = 40
+                # Pulsating glow for selected/hovered nodes
+                pulse = 0.5 + 0.5 * math.sin(
+                    self._anim_time * 3.0 + node.phase * 0.5)
+                glow_alpha_inner = int(80 + 40 * pulse)
+                glow_alpha_mid = int(30 + 20 * pulse)
             elif is_neighbor:
                 glow_alpha_inner = 60
                 glow_alpha_mid = 20
@@ -674,12 +1289,9 @@ class GraphCanvas(QWidget):
                 glow_alpha_inner = 35
                 glow_alpha_mid = 10
 
-            c_inner = QColor(base_color)
-            c_inner.setAlpha(glow_alpha_inner)
-            c_mid = QColor(base_color)
-            c_mid.setAlpha(glow_alpha_mid)
-            c_outer = QColor(base_color)
-            c_outer.setAlpha(0)
+            c_inner = Colors.with_alpha(base_color, glow_alpha_inner)
+            c_mid = Colors.with_alpha(base_color, glow_alpha_mid)
+            c_outer = Colors.with_alpha(base_color, 0)
 
             glow.setColorAt(0.0, c_inner)
             glow.setColorAt(0.4, c_mid)
@@ -693,13 +1305,13 @@ class GraphCanvas(QWidget):
             n_rings = 3 if node.degree >= 4 else (2 if node.degree >= 2 else 1)
             for ring in range(n_rings, 0, -1):
                 ring_r = r + ring * (4 + r * 0.15)
-                ring_color = QColor(node.color)
                 ring_alpha = int(40 / (ring + 0.5))
                 if is_hovered or is_selected:
                     ring_alpha = int(ring_alpha * 2.0)
                 elif is_neighbor:
                     ring_alpha = int(ring_alpha * 1.4)
-                ring_color.setAlpha(min(ring_alpha, 200))
+                ring_color = Colors.with_alpha(QColor(node.color),
+                                               min(ring_alpha, 200))
                 painter.setPen(QPen(ring_color, 1.0))
                 painter.setBrush(Qt.NoBrush)
                 painter.drawEllipse(QPointF(ax, ay), ring_r, ring_r)
@@ -708,17 +1320,17 @@ class GraphCanvas(QWidget):
             core_grad = QRadialGradient(ax - r * 0.2, ay - r * 0.2, r * 1.2)
 
             if is_hovered or is_selected:
-                core_inner = QColor(base_color).lighter(160)
-                core_inner.setAlpha(240)
+                core_inner = Colors.with_alpha(
+                    QColor(base_color).lighter(160), 240)
             elif is_neighbor:
-                core_inner = QColor(base_color).lighter(130)
-                core_inner.setAlpha(200)
+                core_inner = Colors.with_alpha(
+                    QColor(base_color).lighter(130), 200)
             else:
-                core_inner = QColor(base_color).lighter(115)
-                core_inner.setAlpha(180)
+                core_inner = Colors.with_alpha(
+                    QColor(base_color).lighter(115), 180)
 
-            core_outer = QColor(base_color).darker(130)
-            core_outer.setAlpha(120)
+            core_outer = Colors.with_alpha(
+                QColor(base_color).darker(130), 120)
 
             core_grad.setColorAt(0.0, core_inner)
             core_grad.setColorAt(0.7, core_outer)
@@ -730,15 +1342,43 @@ class GraphCanvas(QWidget):
 
             # --- Border ---
             border_alpha = 200 if is_hovered or is_selected else 120
-            border_color = QColor(base_color).lighter(
-                160 if is_hovered or is_selected else 130)
-            border_color.setAlpha(border_alpha)
+            border_color = Colors.with_alpha(
+                QColor(base_color).lighter(
+                    160 if is_hovered or is_selected else 130),
+                border_alpha)
             border_w = 2.0 if is_selected else (1.5 if is_hovered else 1.0)
             painter.setPen(QPen(border_color, border_w))
             painter.setBrush(Qt.NoBrush)
             painter.drawEllipse(QPointF(ax, ay), r, r)
 
-            # --- Label ---
+            # --- Search match highlight ring ---
+            if is_search_match and has_search:
+                pulse = 0.5 + 0.5 * math.sin(self._anim_time * 4.0)
+                ring_alpha = int(120 + 80 * pulse)
+                highlight_color = Colors.with_alpha(QColor(Colors.ACCENT), ring_alpha)
+                painter.setPen(QPen(highlight_color, 2.5))
+                painter.setBrush(Qt.NoBrush)
+                search_ring_r = r + 6
+                painter.drawEllipse(QPointF(ax, ay), search_ring_r, search_ring_r)
+
+            # --- Pin indicator ---
+            if node.pinned:
+                painter.setPen(Qt.NoPen)
+                pin_color = Colors.with_alpha(QColor(Colors.ACCENT), 180)
+                painter.setBrush(QBrush(pin_color))
+                # Small diamond indicator at top of node
+                pin_x = ax
+                pin_y = ay - r - 5
+                pin_s = 3.5
+                pin_path = QPainterPath()
+                pin_path.moveTo(pin_x, pin_y - pin_s)
+                pin_path.lineTo(pin_x + pin_s, pin_y)
+                pin_path.lineTo(pin_x, pin_y + pin_s)
+                pin_path.lineTo(pin_x - pin_s, pin_y)
+                pin_path.closeSubpath()
+                painter.drawPath(pin_path)
+
+            # --- Label with text shadow for readability ---
             if r >= 6 and (is_hovered or is_selected or
                            node.degree >= 2 or len(nodes) <= 40):
                 label = node.label[:16]
@@ -752,15 +1392,120 @@ class GraphCanvas(QWidget):
                 lx = ax - tw / 2
                 ly = ay + r + 4
 
-                bg = QColor(Colors.BG)
-                bg.setAlpha(160)
+                bg = Colors.with_alpha(QColor(Colors.BG), 160)
                 painter.fillRect(int(lx - 3), int(ly - th + 2),
                                  tw + 6, th + 2, bg)
 
                 text_color = QColor(Colors.TEXT) if (
                     is_hovered or is_selected) else QColor(Colors.TEXT_DIM)
+                # Text shadow (offset 1px, semi-transparent dark)
+                shadow_color = Colors.with_alpha(QColor(0, 0, 0), 120)
+                painter.setPen(QPen(shadow_color))
+                painter.drawText(int(lx + 1), int(ly + 3), label)
+                # Main text
                 painter.setPen(QPen(text_color))
                 painter.drawText(int(lx), int(ly + 2), label)
+
+    def _paint_minimap(self, painter: QPainter, w: int, h: int):
+        """Draw a polished minimap overview in the bottom-left corner."""
+        nodes = self.engine.nodes
+        if not nodes:
+            return
+
+        # Minimap dimensions and position
+        mm_w, mm_h = 160, 110
+        mm_margin = 10
+        mm_x = mm_margin
+        mm_y = h - mm_h - mm_margin
+
+        # Find bounding box of all nodes
+        xs = [n.x for n in nodes]
+        ys = [n.y for n in nodes]
+        min_x, max_x = min(xs), max(xs)
+        min_y, max_y = min(ys), max(ys)
+        graph_w = max(max_x - min_x, 1.0)
+        graph_h = max(max_y - min_y, 1.0)
+
+        # Add padding
+        pad = 30
+        min_x -= pad
+        min_y -= pad
+        graph_w += pad * 2
+        graph_h += pad * 2
+
+        # Scale to fit minimap with internal padding
+        inner_pad = 8
+        inner_w = mm_w - inner_pad * 2
+        inner_h = mm_h - inner_pad * 2
+        scale_x = inner_w / max(graph_w, 1.0)
+        scale_y = inner_h / max(graph_h, 1.0)
+        scale = min(scale_x, scale_y)
+
+        # --- Background ---
+        painter.setPen(Qt.NoPen)
+        bg = Colors.with_alpha(QColor(Colors.BG), 200)
+        painter.setBrush(QBrush(bg))
+        painter.drawRoundedRect(mm_x, mm_y, mm_w, mm_h, 6, 6)
+
+        # --- Border ---
+        border_pen = QPen(QColor(Colors.BORDER), 1.0)
+        painter.setPen(border_pen)
+        painter.setBrush(Qt.NoBrush)
+        painter.drawRoundedRect(mm_x, mm_y, mm_w, mm_h, 6, 6)
+
+        # --- Accent top line ---
+        painter.setPen(QPen(QColor(Colors.ACCENT), 1.5))
+        painter.drawLine(mm_x + 1, mm_y, mm_x + mm_w - 1, mm_y)
+
+        # --- Label ---
+        painter.setFont(QFont("monospace", 6))
+        painter.setPen(QPen(QColor(Colors.TEXT_DIM)))
+        painter.drawText(mm_x + 5, mm_y + 10, "OVERVIEW")
+
+        # --- Draw edges on minimap ---
+        for edge in self.engine.edges:
+            if edge.source_idx >= len(nodes) or edge.target_idx >= len(nodes):
+                continue
+            ni = nodes[edge.source_idx]
+            nj = nodes[edge.target_idx]
+            if ni.hidden or nj.hidden:
+                continue
+
+            ex1 = mm_x + inner_pad + (ni.x - min_x) * scale
+            ey1 = mm_y + inner_pad + (ni.y - min_y) * scale
+            ex2 = mm_x + inner_pad + (nj.x - min_x) * scale
+            ey2 = mm_y + inner_pad + (nj.y - min_y) * scale
+
+            painter.setPen(QPen(QColor(255, 255, 255, 25), 0.5))
+            painter.drawLine(QPointF(ex1, ey1), QPointF(ex2, ey2))
+
+        # --- Draw nodes on minimap ---
+        for i, node in enumerate(nodes):
+            if node.hidden:
+                continue
+            nx = mm_x + inner_pad + (node.x - min_x) * scale
+            ny = mm_y + inner_pad + (node.y - min_y) * scale
+
+            dot_r = 1.5 if node.degree >= 3 else 1.0
+
+            is_active = (i == self._hovered_node or
+                         i == self._selected_node)
+            if is_active:
+                # Highlighted node on minimap
+                painter.setPen(Qt.NoPen)
+                glow = QRadialGradient(nx, ny, dot_r * 4)
+                glow.setColorAt(0.0, Colors.with_alpha(QColor(node.color), 120))
+                glow.setColorAt(1.0, Colors.with_alpha(QColor(node.color), 0))
+                painter.setBrush(QBrush(glow))
+                painter.drawEllipse(QPointF(nx, ny), dot_r * 4, dot_r * 4)
+
+                painter.setBrush(QBrush(QColor(node.color).lighter(150)))
+                painter.drawEllipse(QPointF(nx, ny), dot_r * 1.5, dot_r * 1.5)
+            else:
+                painter.setPen(Qt.NoPen)
+                painter.setBrush(QBrush(
+                    Colors.with_alpha(QColor(node.color), 140)))
+                painter.drawEllipse(QPointF(nx, ny), dot_r, dot_r)
 
     def _paint_info(self, painter: QPainter, w: int, h: int):
         """Draw info overlay — bottom-right title block."""
@@ -768,8 +1513,7 @@ class GraphCanvas(QWidget):
         x0, y0 = w - bw - 10, h - bh - 10
 
         painter.setPen(Qt.NoPen)
-        bg = QColor(Colors.BG_RAISED)
-        bg.setAlpha(180)
+        bg = Colors.with_alpha(QColor(Colors.BG_RAISED), 180)
         painter.setBrush(QBrush(bg))
         painter.drawRoundedRect(x0, y0, bw, bh, 6, 6)
 
@@ -804,13 +1548,34 @@ class GraphCanvas(QWidget):
         pos = event.position()
         mx, my = pos.x(), pos.y()
 
+        # Handle panning (middle / right button drag)
+        if self._panning:
+            current_x = mx
+            current_y = my
+            old_pan_x = self._target_pan_x
+            old_pan_y = self._target_pan_y
+            self._target_pan_x = self._pan_start_offset_x + (current_x - self._pan_start_x)
+            self._target_pan_y = self._pan_start_offset_y + (current_y - self._pan_start_y)
+            # Track velocity for momentum
+            self._vel_x = self._target_pan_x - old_pan_x
+            self._vel_y = self._target_pan_y - old_pan_y
+            self.update()
+            return
+
+        # Inverse-transform mouse coords to layout coordinates for hit testing
+        w, h = self.width(), self.height()
+        layout_mx = (mx - w / 2.0 - self._pan_x) / max(self._zoom, 0.01) + w / 2.0
+        layout_my = (my - h / 2.0 - self._pan_y) / max(self._zoom, 0.01) + h / 2.0
+
         closest = -1
         min_d = float('inf')
 
         for i, node in enumerate(nodes):
+            if node.hidden:
+                continue
             ax, ay = self._animated_pos(node)
-            dx = mx - ax
-            dy = my - ay
+            dx = layout_mx - ax
+            dy = layout_my - ay
             d = math.sqrt(dx * dx + dy * dy)
             hit_r = node.radius + 8  # Generous hit area
             if d < hit_r and d < min_d:
@@ -826,12 +1591,68 @@ class GraphCanvas(QWidget):
                 self.setCursor(Qt.ArrowCursor)
             self.update()
 
+        # Edge hover detection — only when no node is hovered
+        if closest < 0:
+            hovered_edge = self._find_edge_at(layout_mx, layout_my)
+            if hovered_edge != self._hovered_edge:
+                self._hovered_edge = hovered_edge
+                if hovered_edge >= 0:
+                    self.setCursor(Qt.CrossCursor)
+                else:
+                    self.setCursor(Qt.ArrowCursor)
+                self.update()
+        else:
+            # Clear edge hover when a node is hovered
+            if self._hovered_edge >= 0:
+                self._hovered_edge = -1
+                self.update()
+
     def mousePressEvent(self, event):
+        # Middle or right button → start panning
+        if event.button() in (Qt.MiddleButton, Qt.RightButton):
+            self._panning = True
+            self._momentum_active = False
+            pos = event.position()
+            self._pan_start_x = pos.x()
+            self._pan_start_y = pos.y()
+            self._pan_start_offset_x = self._target_pan_x
+            self._pan_start_offset_y = self._target_pan_y
+            self.setCursor(Qt.ClosedHandCursor)
+            return
+
         if self._hovered_node >= 0:
             self._selected_node = self._hovered_node
             node = self.engine.nodes[self._selected_node]
             self.node_clicked.emit(node.id)
             self.update()
+
+    def mouseReleaseEvent(self, event):
+        if event.button() in (Qt.MiddleButton, Qt.RightButton):
+            self._panning = False
+            self._momentum_active = True  # Enable momentum on release
+            self.setCursor(Qt.ArrowCursor)
+
+    def wheelEvent(self, event):
+        """Smooth zoom toward mouse position via scroll wheel."""
+        delta = event.angleDelta().y()
+        factor = 1.12 if delta > 0 else 1.0 / 1.12
+        new_target = max(0.15, min(8.0, self._target_zoom * factor))
+
+        if new_target != self._target_zoom:
+            pos = event.position()
+            w, h = self.width(), self.height()
+            mx, my = pos.x(), pos.y()
+
+            # Mouse in layout coords before zoom change
+            old_zoom = self._target_zoom
+            layout_x = (mx - w / 2.0 - self._target_pan_x) / old_zoom + w / 2.0
+            layout_y = (my - h / 2.0 - self._target_pan_y) / old_zoom + h / 2.0
+
+            # After zoom change, adjust pan so same layout point stays under mouse
+            self._target_pan_x = mx - w / 2.0 - (layout_x - w / 2.0) * new_target
+            self._target_pan_y = my - h / 2.0 - (layout_y - h / 2.0) * new_target
+
+            self._target_zoom = new_target
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
@@ -944,6 +1765,11 @@ class GraphControls(QWidget):
         self.animate_check.setChecked(True)
         layout.addWidget(self.animate_check)
 
+        # Edge hover labels toggle
+        self.edge_labels_check = QCheckBox("Edge hover labels")
+        self.edge_labels_check.setChecked(True)
+        layout.addWidget(self.edge_labels_check)
+
         # Separator
         sep3 = QLabel("─" * 30)
         sep3.setStyleSheet(f"color: {Colors.BORDER};")
@@ -1036,6 +1862,68 @@ class GraphView(QWidget):
         )
         layout.addWidget(hdr_w)
 
+        # Search / filter bar
+        search_bar = QHBoxLayout()
+        search_bar.setContentsMargins(12, 4, 12, 4)
+
+        search_icon = QLabel("🔍")
+        search_icon.setFixedWidth(20)
+        search_bar.addWidget(search_icon)
+
+        self._search_input = QLineEdit()
+        self._search_input.setPlaceholderText(
+            "Search nodes by name, label, or category...")
+        self._search_input.setStyleSheet(f"""
+            QLineEdit {{
+                background-color: {Colors.BG};
+                color: {Colors.TEXT};
+                border: 1px solid {Colors.BORDER};
+                border-radius: 6px;
+                padding: 6px 10px;
+                font-size: 12px;
+            }}
+            QLineEdit:focus {{
+                border: 1px solid {Colors.ACCENT};
+            }}
+        """)
+        self._search_input.textChanged.connect(self._on_search_changed)
+        search_bar.addWidget(self._search_input, stretch=1)
+
+        self._search_count = QLabel("")
+        self._search_count.setStyleSheet(
+            f"color: {Colors.TEXT_DIM}; font-size: 10px;"
+        )
+        self._search_count.setFixedWidth(120)
+        search_bar.addWidget(self._search_count)
+
+        # Show All button (unhides hidden nodes)
+        self._show_all_btn = QPushButton("Show All")
+        self._show_all_btn.setFixedWidth(80)
+        self._show_all_btn.setStyleSheet(f"""
+            QPushButton {{
+                background-color: {Colors.BG_RAISED};
+                color: {Colors.TEXT};
+                border: 1px solid {Colors.BORDER};
+                border-radius: 4px;
+                padding: 4px 8px;
+                font-size: 10px;
+            }}
+            QPushButton:hover {{
+                background-color: {Colors.ACCENT};
+                color: {Colors.BG};
+            }}
+        """)
+        self._show_all_btn.clicked.connect(self._show_all_nodes)
+        search_bar.addWidget(self._show_all_btn)
+
+        search_w = QWidget()
+        search_w.setLayout(search_bar)
+        search_w.setStyleSheet(
+            f"background-color: {Colors.BG_RAISED}; "
+            f"border-bottom: 1px solid {Colors.BORDER};"
+        )
+        layout.addWidget(search_w)
+
         # Main splitter: canvas left, controls right
         splitter = QSplitter(Qt.Horizontal)
 
@@ -1054,9 +1942,12 @@ class GraphView(QWidget):
             self._on_layout_changed)
         self.controls.bundle_check.toggled.connect(self.canvas.set_bundling)
         self.controls.animate_check.toggled.connect(self.canvas.set_animating)
+        self.controls.edge_labels_check.toggled.connect(self.canvas.set_edge_labels)
 
         self.canvas.node_clicked.connect(self._on_node_clicked)
         self.canvas.node_hovered.connect(self._on_node_hovered)
+        self.canvas.node_navigate.connect(self._on_node_navigate)
+        self.canvas.node_inspect.connect(self._on_node_inspect)
 
         self.setStyleSheet(f"background-color: {Colors.BG};")
 
@@ -1121,6 +2012,67 @@ class GraphView(QWidget):
             if node.id == node_id:
                 # Could emit tooltip info
                 break
+
+    def _on_node_navigate(self, node_id: str):
+        """Handle Navigate from context menu — emit status with details."""
+        for node in self.canvas.engine.nodes:
+            if node.id == node_id:
+                # Build connections summary
+                conn_ids = [c.get("id", "?") for c in node.connections[:5]]
+                conn_str = ", ".join(conn_ids)
+                if len(node.connections) > 5:
+                    conn_str += f" (+{len(node.connections) - 5} more)"
+                self.signals.status_message.emit(
+                    f"Navigate → {node.label} | "
+                    f"Degree: {node.degree} | "
+                    f"Category: {node.category or 'unknown'} | "
+                    f"Connected: {conn_str}"
+                )
+                break
+
+    def _on_node_inspect(self, node_id: str):
+        """Handle Inspect from context menu — show detailed node info."""
+        for i, node in enumerate(self.canvas.engine.nodes):
+            if node.id == node_id:
+                lines = [
+                    f"Node: {node.label}",
+                    f"ID: {node.id}",
+                    f"Category: {node.category or '—'}",
+                    f"Degree: {node.degree}",
+                    f"Position: ({node.x:.1f}, {node.y:.1f})",
+                    f"Pinned: {node.pinned}",
+                    f"Connections: {len(node.connections)}",
+                ]
+                # Show top connections with scores
+                for ci, conn in enumerate(node.connections[:8]):
+                    cid = conn.get("id", "?")
+                    score = conn.get("score", 0)
+                    lines.append(f"  → {cid} (score: {score:.2f})")
+                if len(node.connections) > 8:
+                    lines.append(
+                        f"  ... and {len(node.connections) - 8} more")
+
+                self.controls.info.setText("\n".join(lines))
+                self.signals.status_message.emit(
+                    f"Inspecting: {node.label}")
+                break
+
+    def _on_search_changed(self, text: str):
+        """Handle search input text changes."""
+        self.canvas.set_search_filter(text)
+        n_matches = len(self.canvas._search_matches)
+        n_total = len(self.canvas.engine.nodes)
+        if text.strip():
+            self._search_count.setText(
+                f"{n_matches} / {n_total} nodes")
+        else:
+            self._search_count.setText("")
+
+    def _show_all_nodes(self):
+        """Unhide all hidden nodes."""
+        for node in self.canvas.engine.nodes:
+            node.hidden = False
+        self.canvas.update()
 
     def get_params(self) -> list:
         return [

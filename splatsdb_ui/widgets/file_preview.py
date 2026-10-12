@@ -9,13 +9,20 @@ from pathlib import Path
 
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
-    QTextEdit, QScrollArea, QFrame, QSizePolicy,
+    QTextEdit, QScrollArea, QFrame, QSizePolicy, QApplication,
 )
-from PySide6.QtCore import Signal, Qt
-from PySide6.QtGui import QPixmap, QImage, QFont
+from PySide6.QtCore import Signal, Qt, QTimer, QPropertyAnimation, QEasingCurve
+from PySide6.QtGui import QPixmap, QImage, QFont, QPainter, QColor
 
 from splatsdb_ui.utils.theme import Colors
 from splatsdb_ui.utils.icons import icon
+
+_HAS_PYMUPDF = False
+try:
+    import fitz  # PyMuPDF
+    _HAS_PYMUPDF = True
+except ImportError:
+    pass
 
 
 class FilePreview(QWidget):
@@ -59,6 +66,43 @@ class FilePreview(QWidget):
         header_widget.setStyleSheet(f"background-color: {Colors.BG_RAISED}; border-bottom: 1px solid {Colors.BORDER};")
         layout.addWidget(header_widget)
 
+        # Zoom controls (created once, shown only for image previews)
+        self._zoom_controls = QWidget()
+        zr = QHBoxLayout(self._zoom_controls)
+        zr.setAlignment(Qt.AlignCenter)
+        zr.setSpacing(4)
+        zr.setContentsMargins(0, 4, 0, 4)
+
+        self._zoom_out_btn = QPushButton("−")
+        self._zoom_out_btn.setFixedSize(28, 28)
+        self._zoom_out_btn.setStyleSheet(
+            f"QPushButton {{ background: {Colors.BG_RAISED}; color: {Colors.TEXT}; "
+            f"border: 1px solid {Colors.BORDER}; border-radius: 4px; font-size: 14px; }}"
+            f"QPushButton:hover {{ border-color: {Colors.ACCENT}; }}"
+        )
+        self._zoom_out_btn.clicked.connect(lambda: self._apply_zoom(-0.2))
+        zr.addWidget(self._zoom_out_btn)
+
+        self._zoom_label = QLabel("100%")
+        self._zoom_label.setStyleSheet(
+            f"color: {Colors.TEXT_DIM}; font-size: 11px; min-width: 40px;"
+        )
+        self._zoom_label.setAlignment(Qt.AlignCenter)
+        zr.addWidget(self._zoom_label)
+
+        self._zoom_in_btn = QPushButton("+")
+        self._zoom_in_btn.setFixedSize(28, 28)
+        self._zoom_in_btn.setStyleSheet(
+            f"QPushButton {{ background: {Colors.BG_RAISED}; color: {Colors.TEXT}; "
+            f"border: 1px solid {Colors.BORDER}; border-radius: 4px; font-size: 14px; }}"
+            f"QPushButton:hover {{ border-color: {Colors.ACCENT}; }}"
+        )
+        self._zoom_in_btn.clicked.connect(lambda: self._apply_zoom(0.2))
+        zr.addWidget(self._zoom_in_btn)
+
+        self._zoom_controls.hide()
+        layout.addWidget(self._zoom_controls)
+
         # Content area
         self.scroll = QScrollArea()
         self.scroll.setWidgetResizable(True)
@@ -79,7 +123,7 @@ class FilePreview(QWidget):
         layout.addWidget(self.scroll, stretch=1)
 
         self.setMinimumHeight(200)
-        self.setStyleSheet(f"background-color: {Colors.BG};")
+        self.setStyleSheet(f"FilePreview {{ background-color: {Colors.BG}; }}")
 
     def preview_file(self, file_path: str):
         """Preview a file based on its extension."""
@@ -118,51 +162,83 @@ class FilePreview(QWidget):
             self._show_message(f"Preview not available for {suffix}\n{self._format_size(path)}")
 
     def _preview_image(self, path: Path):
-        """Show image inline."""
-        pixmap = QPixmap(str(path))
-        if pixmap.isNull():
+        """Show image inline with zoom controls."""
+        self._current_pixmap = QPixmap(str(path))
+        if self._current_pixmap.isNull():
             self._show_message("Could not load image")
             return
 
-        # Scale to fit
-        max_w = self.scroll.viewport().width() - 20
-        max_h = self.scroll.viewport().height() - 20
-        if max_w < 100:
-            max_w = 500
-        if max_h < 100:
-            max_h = 400
+        self._img_zoom = 1.0
+        self._zoom_label.setText("100%")
+        self._zoom_controls.show()
 
-        scaled = pixmap.scaled(max_w, max_h, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+        # Image
+        self._img_label = QLabel()
+        self._update_scaled_image()
+        self._img_label.setAlignment(Qt.AlignCenter)
+        self.content_layout.addWidget(self._img_label)
 
-        img_label = QLabel()
-        img_label.setPixmap(scaled)
-        img_label.setAlignment(Qt.AlignCenter)
-        self.content_layout.addWidget(img_label)
-
-        # Info
-        info = QLabel(f"{pixmap.width()} x {pixmap.height()}  |  {self._format_size(path)}")
+        # Metadata
+        stat = path.stat()
+        from datetime import datetime
+        meta_text = (
+            f"{self._current_pixmap.width()} × {self._current_pixmap.height()}  |  "
+            f"{self._format_size(path)}  |  "
+            f"Modified: {datetime.fromtimestamp(stat.st_mtime).strftime('%Y-%m-%d %H:%M')}"
+        )
+        info = QLabel(meta_text)
         info.setAlignment(Qt.AlignCenter)
         info.setStyleSheet(f"color: {Colors.TEXT_DIM}; font-size: 11px; padding: 6px;")
         self.content_layout.addWidget(info)
 
-    def _preview_text(self, path: Path):
-        """Show text file with syntax highlighting."""
-        try:
-            text = path.read_text(encoding="utf-8", errors="replace")
-        except Exception as e:
-            text = f"Error reading file: {e}"
+    def _apply_zoom(self, delta: float):
+        if not hasattr(self, '_current_pixmap') or self._current_pixmap.isNull():
+            return
+        self._img_zoom = max(0.1, min(5.0, self._img_zoom + delta))
+        self._zoom_label.setText(f"{int(self._img_zoom * 100)}%")
+        self._update_scaled_image()
 
-        # Truncate very large files
-        lines = text.splitlines()
+    def _update_scaled_image(self):
+        if not hasattr(self, '_current_pixmap') or self._current_pixmap.isNull():
+            return
+        max_w = max(100, self.scroll.viewport().width() - 20)
+        max_h = max(100, self.scroll.viewport().height() - 60)
+        # Compute viewport-fit size, then apply zoom — single scale pass
+        fit_size = self._current_pixmap.size().scaled(max_w, max_h, Qt.KeepAspectRatio)
+        target_w = max(1, int(fit_size.width() * self._img_zoom))
+        target_h = max(1, int(fit_size.height() * self._img_zoom))
+        scaled = self._current_pixmap.scaled(
+            target_w, target_h, Qt.KeepAspectRatio, Qt.SmoothTransformation,
+        )
+        self._img_label.setPixmap(scaled)
+
+    def _preview_text(self, path: Path):
+        """Show text file with line numbers and metadata."""
         max_lines = 500
-        truncated = len(lines) > max_lines
+        lines = []
+        truncated = False
+        try:
+            with open(path, "r", encoding="utf-8", errors="replace") as f:
+                for i, line in enumerate(f):
+                    if i >= max_lines:
+                        truncated = True
+                        break
+                    lines.append(line.rstrip("\n\r"))
+        except Exception as e:
+            lines = [f"Error reading file: {e}"]
+
+        # Add line numbers
+        numbered_lines = []
+        for i, line in enumerate(lines, 1):
+            numbered_lines.append(f"{i:>4}  {line}")
+        numbered_text = "\n".join(numbered_lines)
         if truncated:
-            text = "\n".join(lines[:max_lines]) + f"\n\n... ({len(lines) - max_lines} more lines)"
+            numbered_text += "\n\n... (more lines below)"
 
         text_edit = QTextEdit()
         text_edit.setReadOnly(True)
         text_edit.setFont(QFont("monospace", 11))
-        text_edit.setText(text)
+        text_edit.setText(numbered_text)
         text_edit.setStyleSheet(f"""
             QTextEdit {{
                 background-color: {Colors.BG};
@@ -174,15 +250,27 @@ class FilePreview(QWidget):
         """)
         self.content_layout.addWidget(text_edit)
 
-        info = QLabel(f"{len(lines)} lines  |  {self._format_size(path)}")
+        # Metadata
+        stat = path.stat()
+        from datetime import datetime
+        line_count_str = f"{max_lines}+" if truncated else str(len(lines))
+        meta_text = (
+            f"{line_count_str} lines  |  {self._format_size(path)}  |  "
+            f"Modified: {datetime.fromtimestamp(stat.st_mtime).strftime('%Y-%m-%d %H:%M')}"
+        )
+        info = QLabel(meta_text)
         info.setAlignment(Qt.AlignCenter)
         info.setStyleSheet(f"color: {Colors.TEXT_DIM}; font-size: 11px; padding: 4px;")
         self.content_layout.addWidget(info)
 
     def _preview_pdf(self, path: Path):
         """Show PDF info and first page if possible."""
+        if not _HAS_PYMUPDF:
+            self._show_message(
+                f"PDF preview requires PyMuPDF\n\n{path.name}\n{self._format_size(path)}\n\nClick the link icon to open externally."
+            )
+            return
         try:
-            import fitz  # PyMuPDF
             doc = fitz.open(str(path))
             page = doc.load_page(0)
             pix = page.get_pixmap(matrix=fitz.Matrix(2, 2))
@@ -204,10 +292,6 @@ class FilePreview(QWidget):
             info.setStyleSheet(f"color: {Colors.TEXT_DIM}; font-size: 11px; padding: 4px;")
             self.content_layout.addWidget(info)
             doc.close()
-        except ImportError:
-            self._show_message(
-                f"PDF preview requires PyMuPDF\n\n{path.name}\n{self._format_size(path)}\n\nClick the link icon to open externally."
-            )
         except Exception as e:
             self._show_message(f"Error loading PDF:\n{e}")
 
@@ -239,10 +323,12 @@ class FilePreview(QWidget):
 
     def _clear_content(self):
         """Remove all content widgets."""
+        self._zoom_controls.hide()
         while self.content_layout.count():
             item = self.content_layout.takeAt(0)
             if item.widget():
                 item.widget().deleteLater()
+        self.content_layout.invalidate()
 
     def _open_external(self):
         if self._current_file:
